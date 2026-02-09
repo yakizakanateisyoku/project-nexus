@@ -292,6 +292,17 @@ struct MachineStatus {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Load .env file (API keys etc.) — GUI起動時に環境変数が見えない問題の対策
+    // 1. カレントディレクトリの.envを試行
+    if dotenvy::dotenv().is_err() {
+        // 2. 実行ファイルと同階層の.envを試行
+        if let Ok(exe_path) = std::env::current_exe() {
+            if let Some(exe_dir) = exe_path.parent() {
+                let env_path = exe_dir.join(".env");
+                let _ = dotenvy::from_path(&env_path);
+            }
+        }
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(Mutex::new(ChatState::default()))
