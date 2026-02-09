@@ -428,3 +428,25 @@ html, body {
   opacity: 0.4;
   cursor: default;
 }
+
+/* Model Selector */
+.model-select {
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 2px 8px;
+  font-size: 0.75rem;
+  cursor: pointer;
+  outline: none;
+  margin-left: 8px;
+}
+
+.model-select:hover {
+  border-color: var(--accent-dim);
+  color: var(--text-primary);
+}
+
+.model-select:focus {
+  border-color: var(--accent);
+}

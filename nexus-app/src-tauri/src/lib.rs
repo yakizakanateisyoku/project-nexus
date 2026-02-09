@@ -1,44 +1,207 @@
 // Project Nexus — Tauri Backend
-// Phase 1: Basic message handling (mock) + System Tray
-// Phase 2: Claude Code CLI integration
+// Phase 2: Anthropic API Direct Integration
+// - HTTP direct call (no subprocess, no audio glitch)
+// - Conversation history management
+// - Model switching support
 
-use std::process::Command;
+use serde::{Deserialize, Serialize};
+use std::sync::Mutex;
 use tauri::{
     menu::{MenuBuilder, MenuItemBuilder},
     tray::TrayIconBuilder,
-    Manager, WindowEvent,
+    Manager, State, WindowEvent,
 };
 
-/// Send a message to Claude Code CLI and return the response.
-/// Runs in a blocking thread via Tauri's async runtime to keep UI responsive.
-#[tauri::command]
-async fn send_message(message: String) -> Result<String, String> {
-    // Run CLI in a blocking thread so the UI doesn't freeze
-    tauri::async_runtime::spawn_blocking(move || {
-        // Use full path to npm's claude.cmd to avoid picking up
-        // the Claude Desktop app (claude.exe) which sits earlier in PATH.
-        let home = std::env::var("USERPROFILE").unwrap_or_default();
-        let claude_cmd = format!(r"{}\AppData\Roaming\npm\claude.cmd", home);
+// ========================================
+// Anthropic API Types
+// ========================================
 
-        let output = Command::new("cmd")
-            .args(["/c", &claude_cmd, "-p", &message])
-            .output()
-            .map_err(|e| format!("Claude Code CLIの起動に失敗: {}", e))?;
+#[derive(Serialize, Clone)]
+struct ApiMessage {
+    role: String,
+    content: String,
+}
 
-        if output.status.success() {
-            let response = String::from_utf8_lossy(&output.stdout).to_string();
-            if response.trim().is_empty() {
-                Ok("(空の応答が返されました)".to_string())
-            } else {
-                Ok(response)
-            }
-        } else {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            Err(format!("Claude Code CLIエラー: {}", stderr))
+#[derive(Serialize)]
+struct ApiRequest {
+    model: String,
+    max_tokens: u32,
+    messages: Vec<ApiMessage>,
+}
+
+#[derive(Deserialize)]
+struct ApiResponse {
+    content: Vec<ContentBlock>,
+}
+
+#[derive(Deserialize)]
+struct ContentBlock {
+    text: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ApiError {
+    error: Option<ApiErrorDetail>,
+}
+
+#[derive(Deserialize)]
+struct ApiErrorDetail {
+    message: Option<String>,
+}
+
+// ========================================
+// App State
+// ========================================
+
+struct ChatState {
+    history: Vec<ApiMessage>,
+    model: String,
+}
+
+impl Default for ChatState {
+    fn default() -> Self {
+        Self {
+            history: Vec::new(),
+            model: "claude-sonnet-4-5-20250929".to_string(),
         }
-    })
-    .await
-    .map_err(|e| format!("スレッドエラー: {}", e))?
+    }
+}
+
+const MAX_HISTORY: usize = 20; // 直近20メッセージを保持
+const API_URL: &str = "https://api.anthropic.com/v1/messages";
+
+// ========================================
+// Tauri Commands
+// ========================================
+
+/// Send a message via Anthropic API (non-streaming)
+#[tauri::command]
+async fn send_message(
+    message: String,
+    state: State<'_, Mutex<ChatState>>,
+) -> Result<String, String> {
+    let api_key = std::env::var("ANTHROPIC_API_KEY")
+        .map_err(|_| "ANTHROPIC_API_KEY 環境変数が設定されていません".to_string())?;
+
+    // Build messages list from history
+    let messages = {
+        let mut chat = state.lock().map_err(|e| format!("State lock error: {}", e))?;
+
+        // Add user message to history
+        chat.history.push(ApiMessage {
+            role: "user".to_string(),
+            content: message,
+        });
+
+        // Trim history to last N messages
+        if chat.history.len() > MAX_HISTORY {
+            let drain_count = chat.history.len() - MAX_HISTORY;
+            chat.history.drain(..drain_count);
+        }
+
+        chat.history.clone()
+    };
+
+    let model = {
+        let chat = state.lock().map_err(|e| format!("State lock error: {}", e))?;
+        chat.model.clone()
+    };
+
+    // Call Anthropic API
+    let client = reqwest::Client::new();
+    let body = ApiRequest {
+        model,
+        max_tokens: 4096,
+        messages,
+    };
+
+    let response = client
+        .post(API_URL)
+        .header("x-api-key", &api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("API接続エラー: {}", e))?;
+
+    let status = response.status();
+    let response_text = response
+        .text()
+        .await
+        .map_err(|e| format!("レスポンス読み取りエラー: {}", e))?;
+
+    if !status.is_success() {
+        // Try to parse error message
+        if let Ok(err) = serde_json::from_str::<ApiError>(&response_text) {
+            if let Some(detail) = err.error {
+                return Err(format!(
+                    "API Error ({}): {}",
+                    status,
+                    detail.message.unwrap_or_default()
+                ));
+            }
+        }
+        return Err(format!("API Error ({}): {}", status, response_text));
+    }
+
+    // Parse success response
+    let api_resp: ApiResponse = serde_json::from_str(&response_text)
+        .map_err(|e| format!("レスポンスパースエラー: {}", e))?;
+
+    let assistant_text = api_resp
+        .content
+        .into_iter()
+        .filter_map(|block| block.text)
+        .collect::<Vec<_>>()
+        .join("");
+
+    if assistant_text.is_empty() {
+        return Ok("(空の応答が返されました)".to_string());
+    }
+
+    // Add assistant response to history
+    {
+        let mut chat = state.lock().map_err(|e| format!("State lock error: {}", e))?;
+        chat.history.push(ApiMessage {
+            role: "assistant".to_string(),
+            content: assistant_text.clone(),
+        });
+    }
+
+    Ok(assistant_text)
+}
+
+/// Clear conversation history
+#[tauri::command]
+fn clear_history(state: State<'_, Mutex<ChatState>>) -> Result<(), String> {
+    let mut chat = state.lock().map_err(|e| format!("State lock error: {}", e))?;
+    chat.history.clear();
+    Ok(())
+}
+
+/// Switch model
+#[tauri::command]
+fn set_model(model_id: String, state: State<'_, Mutex<ChatState>>) -> Result<String, String> {
+    let valid_models = [
+        "claude-sonnet-4-5-20250929",
+        "claude-haiku-4-5-20251001",
+    ];
+
+    if !valid_models.contains(&model_id.as_str()) {
+        return Err(format!("無効なモデル: {}", model_id));
+    }
+
+    let mut chat = state.lock().map_err(|e| format!("State lock error: {}", e))?;
+    chat.model = model_id.clone();
+    Ok(format!("モデルを {} に変更しました", model_id))
+}
+
+/// Get current model info
+#[tauri::command]
+fn get_current_model(state: State<'_, Mutex<ChatState>>) -> Result<String, String> {
+    let chat = state.lock().map_err(|e| format!("State lock error: {}", e))?;
+    Ok(chat.model.clone())
 }
 
 /// Get the status of connected machines.
@@ -63,19 +226,27 @@ fn get_machine_status() -> Vec<MachineStatus> {
     ]
 }
 
-#[derive(serde::Serialize)]
+#[derive(Serialize)]
 struct MachineStatus {
     name: String,
     role: String,
     online: bool,
 }
 
+// ========================================
+// App Entry
+// ========================================
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .manage(Mutex::new(ChatState::default()))
         .invoke_handler(tauri::generate_handler![
             send_message,
+            clear_history,
+            set_model,
+            get_current_model,
             get_machine_status,
         ])
         .setup(|app| {
@@ -97,8 +268,6 @@ pub fn run() {
                         }
                     }
                     "quit" => {
-                        // Hide window first, then give WebView2 a brief
-                        // moment to release GPU/audio resources before exit.
                         if let Some(w) = app.get_webview_window("main") {
                             let _ = w.hide();
                         }
@@ -122,7 +291,6 @@ pub fn run() {
 
             Ok(())
         })
-        // Hide window instead of closing (minimize to tray)
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();

@@ -1,5 +1,6 @@
 // ========================================
 // Project Nexus — Chat UI Controller
+// Phase 2: Anthropic API integration
 // ========================================
 
 const { invoke } = window.__TAURI__.core;
@@ -31,7 +32,7 @@ window.addEventListener("DOMContentLoaded", () => {
     handleSend();
   });
 
-  // Textarea auto-resize + Enter handling
+  // Textarea Enter handling
   chatInputEl.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
@@ -43,7 +44,43 @@ window.addEventListener("DOMContentLoaded", () => {
     autoResizeTextarea();
   });
 
-  // Focus input on load
+  // Model selector
+  const modelSelect = document.getElementById("model-select");
+  if (modelSelect) {
+    // Load current model
+    invoke("get_current_model").then((model) => {
+      modelSelect.value = model;
+    });
+
+    modelSelect.addEventListener("change", async (e) => {
+      try {
+        const result = await invoke("set_model", { modelId: e.target.value });
+        addMessage("system", result);
+      } catch (err) {
+        addMessage("system", `Error: ${err}`);
+        // Revert selector
+        const current = await invoke("get_current_model");
+        modelSelect.value = current;
+      }
+    });
+  }
+
+  // New chat button
+  const newChatBtn = document.getElementById("new-chat-btn");
+  if (newChatBtn) {
+    newChatBtn.addEventListener("click", async () => {
+      try {
+        await invoke("clear_history");
+        messagesEl.innerHTML = "";
+        messageHistory = [];
+        updateContextBadge();
+        addMessage("system", "会話履歴をクリアしました");
+      } catch (err) {
+        addMessage("system", `Error: ${err}`);
+      }
+    });
+  }
+
   chatInputEl.focus();
 });
 
@@ -54,14 +91,12 @@ async function handleSend() {
   const text = chatInputEl.value.trim();
   if (!text || isProcessing) return;
 
-  // Add user message
   addMessage("user", text);
   chatInputEl.value = "";
   autoResizeTextarea();
   setProcessing(true);
 
   try {
-    // Call Rust backend
     const response = await invoke("send_message", { message: text });
     addMessage("assistant", response);
   } catch (err) {
@@ -83,6 +118,8 @@ function addMessage(role, content) {
   let inner = "";
   if (role === "assistant") {
     inner += `<div class="message-sender">Claude</div>`;
+  } else if (role === "system") {
+    inner += `<div class="message-sender">System</div>`;
   }
   inner += `<div class="message-content">${escapeHtml(content)}</div>`;
 
@@ -90,8 +127,10 @@ function addMessage(role, content) {
   messagesEl.appendChild(msgEl);
   scrollToBottom();
 
-  // Track history
-  messageHistory.push({ role, content });
+  // Track history (system messages don't count toward context)
+  if (role !== "system") {
+    messageHistory.push({ role, content });
+  }
   updateContextBadge();
 }
 
@@ -136,16 +175,14 @@ function escapeHtml(text) {
 }
 
 function updateContextBadge() {
-  // Rough estimation: ~4 chars per token
   const totalChars = messageHistory.reduce((sum, m) => sum + m.content.length, 0);
   const estimatedTokens = Math.round(totalChars / 4);
-  const maxTokens = 200000; // Claude context window
+  const maxTokens = 200000;
   const percent = Math.min(Math.round((estimatedTokens / maxTokens) * 100), 100);
 
   const textEl = contextBadgeEl.querySelector(".context-text");
   textEl.textContent = `${percent}%`;
 
-  // Color coding
   if (percent > 75) {
     contextBadgeEl.style.color = "var(--danger)";
   } else if (percent > 50) {

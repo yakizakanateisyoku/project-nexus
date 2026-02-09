@@ -53,7 +53,7 @@
               <span class="session-name">General</span>
             </div>
           </div>
-          <button class="new-session-btn" id="new-session-btn">+ New Session</button>
+          <button class="new-session-btn" id="new-chat-btn">+ New Chat</button>
         </div>
 
         <!-- Footer -->
@@ -68,7 +68,11 @@
         <header class="chat-header">
           <div class="chat-header-left">
             <h2 class="chat-title">General</h2>
-            <span class="chat-target">OMEN — Claude Code</span>
+            <span class="chat-target">OMEN — API Direct</span>
+            <select class="model-select" id="model-select">
+              <option value="claude-sonnet-4-5-20250929">Sonnet 4.5</option>
+              <option value="claude-haiku-4-5-20251001">Haiku 4.5</option>
+            </select>
           </div>
           <div class="chat-header-right">
             <span class="context-badge" id="context-badge" title="Context usage">
@@ -83,7 +87,7 @@
           <div class="message system">
             <div class="message-content">
               Project Nexus v0.1.0 — Ready.<br>
-              Type a message to start a session with Claude Code on OMEN.
+              Type a message to start. (API Direct — Sonnet 4.5)
             </div>
           </div>
         </div>
