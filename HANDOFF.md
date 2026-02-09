@@ -1,6 +1,6 @@
 # Project Nexus — 引き継ぎ資料
 
-> **最終更新**: 2026-02-10 (Phase 3-B SIGMA SSH完了)
+> **最終更新**: 2026-02-10 (Phase 3-B Precision SSH設定済み・ネットワーク未解決)
 > **リポジトリ**: https://github.com/yakizakanateisyoku/project-nexus
 > **作業PC**: OMEN（Commander）
 
@@ -22,7 +22,7 @@ SSH経由でリモート制御し、複数PCでAIタスクを分散実行する�
 | 2 | Anthropic API直接統合・会話管理 | ✅ 完了 |
 | 3-A | SSH基盤構築（OMEN側） | ✅ 完了 |
 | 3-C | UI拡張（マシン監視・リモート実行） | ✅ 完了 |
-| 3-B | リモートPC環境セットアップ | 🔶 進行中（SIGMA SSH完了、Precision未着手） |
+| 3-B | リモートPC環境セットアップ | 🔶 SIGMA完了・Precision SSH設定済み（ネットワーク未解決でスキップ） |
 | 4 | スマート機能（ストリーミング等） | ⬜ 予定 |
 | 5 | マルチAI連携（GPT-4o, Gemini） | ⬜ 予定 |
 | 6 | 磨き込み（Notion連携, UI/UX） | ⬜ 予定 |
@@ -72,10 +72,14 @@ SSH経由でリモート制御し、複数PCでAIタスクを分散実行する�
 - ⬜ Node.js インストール
 - ⬜ Claude Code インストール
 
-### Precision（Dell Precision） — 未着手
-- ⬜ OpenSSH Server有効化、公開鍵配置
-- ⬜ Node.js, Claude Code インストール
-- ⬜ OMEN → Precision SSH鍵認証テスト
+### Precision（Dell Precision 3630） — SSH設定済み / ネットワーク未解決
+- ✅ OpenSSH Server有効化・sshd起動（自動起動）
+- ✅ sshd_config（BOMなし、StrictModes no）
+- ✅ authorized_keys配置（BOMなし、nexus@omen鍵）
+- ✅ ファイアウォールルール設定
+- ⛔ OMEN → Precision SSH接続: 10G/1G VLAN間ルーティング未解決
+- ⬜ Node.js, Claude Code インストール（SSH接続確立後）
+- **ブロッカー**: x510スイッチで10Gポート⇔1Gポートが通信不可。VLAN設定修正が必要
 
 ### SSH接続情報（確定）
 ```
@@ -164,7 +168,7 @@ project-nexus/
 |--------|-----|---------|------|
 | OMEN | 192.168.1.13 | DESKTOP-F8TVJN2 | Commander（メイン） |
 | SIGMA | 192.168.1.3 | LP-Sigma | Remote（サブ） |
-| Precision | 未設定 | 未設定 | Remote（予定） |
+| Precision | 192.168.1.150 | Precision3630 | Remote（1Gネットワーク・VLAN問題あり） |
 
 ## コミット履歴
 

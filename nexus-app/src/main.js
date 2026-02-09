@@ -4,6 +4,7 @@
 // ========================================
 
 const { invoke } = window.__TAURI__.core;
+const { listen } = window.__TAURI__.event;
 
 // DOM Elements
 let messagesEl;
@@ -37,6 +38,15 @@ const MODEL_PRICING = {
 // Context warning thresholds
 const CONTEXT_WARN_PERCENT = 75;
 const CONTEXT_CRITICAL_PERCENT = 90;
+
+// ========================================
+// Utilities
+// ========================================
+function escapeHtml(text) {
+  const div = document.createElement("div");
+  div.textContent = text;
+  return div.innerHTML;
+}
 
 // ========================================
 // Initialization
@@ -103,9 +113,13 @@ window.addEventListener("DOMContentLoaded", () => {
         messagesEl.innerHTML = "";
         messageHistory = [];
         currentTokenStats = null;
-        updateContextBadge(null);
+        // コンテキスト%のみリセット、コスト累計は保持
+        const textEl = contextBadgeEl.querySelector(".context-text");
+        textEl.textContent = "0%";
+        contextBadgeEl.style.color = "var(--text-secondary)";
+        contextBadgeEl.title = "";
         removeContextWarning();
-        addMessage("system", "会話履歴をクリアしました");
+        addMessage("system", "会話履歴をクリアしました（コスト累計は保持）");
       } catch (err) {
         addMessage("system", `Error: ${err}`);
       }
@@ -120,6 +134,28 @@ window.addEventListener("DOMContentLoaded", () => {
       handleRemoteExec();
     }
   });
+
+  // Cost badge: click to reset cumulative cost
+  const costBadge = document.getElementById("cost-badge");
+  if (costBadge) {
+    costBadge.style.cursor = "pointer";
+    costBadge.title = "クリックでコスト累計をリセット";
+    costBadge.addEventListener("click", async () => {
+      if (confirm("コスト累計をリセットしますか？")) {
+        try {
+          await invoke("reset_cost");
+          currentTokenStats = null;
+          costBadge.textContent = "$0.00";
+          addMessage("system", "コスト累計をリセットしました");
+        } catch (err) {
+          addMessage("system", `Error: ${err}`);
+        }
+      }
+    });
+  }
+
+  // Tool Use: Tauri events for real-time status
+  setupToolUseEvents();
 
   // Initial machine status + start polling
   refreshMachineStatus();
@@ -142,8 +178,8 @@ async function handleSend() {
 
   try {
     const response = await invoke("send_message", { message: text });
-    // Phase 3: response is now { text, token_stats }
-    addMessage("assistant", response.text);
+    // Phase 3-B: response is { text, token_stats, tool_executions }
+    addAssistantMessage(response.text, response.tool_executions || []);
     currentTokenStats = response.token_stats;
     updateContextBadge(response.token_stats);
     checkContextWarning(response.token_stats);
@@ -213,13 +249,7 @@ function scrollToBottom() {
 
 function autoResizeTextarea() {
   chatInputEl.style.height = "auto";
-  chatInputEl.style.height = Math.min(chatInputEl.scrollHeight, 120) + "px";
-}
-
-function escapeHtml(text) {
-  const div = document.createElement("div");
-  div.textContent = text;
-  return div.innerHTML;
+  chatInputEl.style.height = Math.min(chatInputEl.scrollHeight, 200) + "px";
 }
 
 function updateContextBadge(stats) {
@@ -254,8 +284,8 @@ function updateContextBadge(stats) {
   // Update token detail tooltip
   if (stats) {
     contextBadgeEl.title = `Context: ${inputTokens.toLocaleString()} / ${contextWindow.toLocaleString()} tokens\n` +
-      `Session: ${stats.total_input_tokens.toLocaleString()} in / ${stats.total_output_tokens.toLocaleString()} out\n` +
-      `Requests: ${stats.request_count}\nCost: ${costText}`;
+      `累計: ${stats.total_input_tokens.toLocaleString()} in / ${stats.total_output_tokens.toLocaleString()} out\n` +
+      `Requests: ${stats.request_count}\n累計コスト: ${costText}`;
   }
 
   // Color coding
@@ -412,8 +442,111 @@ async function handleRemoteExec() {
   }
 }
 
-function escapeHtml(text) {
-  const div = document.createElement("div");
-  div.textContent = text;
-  return div.innerHTML;
+// ========================================
+// Phase 3-B: Tool Use — Real-time Status & Display
+// ========================================
+
+/**
+ * Tauri イベントリスナー設定（tool-executing / tool-completed）
+ * ツール実行中のリアルタイム状態表示
+ */
+function setupToolUseEvents() {
+  listen("tool-executing", (event) => {
+    const { machine_name, command } = event.payload;
+    showToolStatus(machine_name, command, "executing");
+  });
+
+  listen("tool-completed", (event) => {
+    const { machine_name, command, success } = event.payload;
+    showToolStatus(machine_name, command, success ? "success" : "error");
+  });
 }
+
+/**
+ * ツール実行ステータスをタイピングインジケーター領域に表示
+ */
+function showToolStatus(machineName, command, status) {
+  // 既存のタイピングインジケーターを除去
+  const typingEl = messagesEl.querySelector(".typing-message");
+  if (typingEl) typingEl.remove();
+
+  const statusEl = document.createElement("div");
+  statusEl.className = "message assistant tool-status-message";
+
+  const icon = status === "executing" ? "⚙️" : status === "success" ? "✅" : "❌";
+  const statusText = status === "executing" ? "実行中" : status === "success" ? "完了" : "エラー";
+  // コマンドが長い場合は省略
+  const shortCmd = command.length > 40 ? command.substring(0, 37) + "..." : command;
+
+  statusEl.innerHTML = `
+    <div class="message-content tool-status ${status}">
+      <span class="tool-status-icon">${icon}</span>
+      <span class="tool-status-text">${machineName}: <code>${escapeHtml(shortCmd)}</code> ${statusText}</span>
+      ${status === "executing" ? '<span class="tool-spinner"></span>' : ''}
+    </div>
+  `;
+
+  messagesEl.appendChild(statusEl);
+  scrollToBottom();
+}
+
+/**
+ * アシスタントメッセージ表示（ツール実行サマリー付き）
+ */
+function addAssistantMessage(text, toolExecutions) {
+  // ツールステータスメッセージをクリーンアップ
+  messagesEl.querySelectorAll(".tool-status-message").forEach((el) => el.remove());
+  // タイピングインジケーターも除去
+  const typingEl = messagesEl.querySelector(".typing-message");
+  if (typingEl) typingEl.remove();
+
+  const msgEl = document.createElement("div");
+  msgEl.className = "message assistant";
+
+  let inner = `<div class="message-sender">Claude</div>`;
+  inner += `<div class="message-content">${escapeHtml(text)}</div>`;
+
+  // ツール実行があった場合、コラプシブルなサマリーを追加
+  if (toolExecutions.length > 0) {
+    inner += buildToolExecutionSummary(toolExecutions);
+  }
+
+  msgEl.innerHTML = inner;
+  messagesEl.appendChild(msgEl);
+  scrollToBottom();
+
+  // 履歴に追加
+  messageHistory.push({ role: "assistant", content: text });
+  updateContextBadge();
+}
+
+/**
+ * ツール実行サマリーHTML生成（コラプシブル）
+ */
+function buildToolExecutionSummary(executions) {
+  const count = executions.length;
+  const successCount = executions.filter((e) => e.success).length;
+  const label = `🔧 ${count}件のコマンド実行（${successCount}/${count} 成功）`;
+
+  let detailsHtml = "";
+  for (const exec of executions) {
+    const icon = exec.success ? "✓" : "✗";
+    const cls = exec.success ? "exec-success" : "exec-error";
+    const output = exec.stdout || exec.stderr || "(出力なし)";
+    // 出力が長い場合は折りたたみ内でも省略
+    const shortOutput = output.length > 500 ? output.substring(0, 497) + "..." : output;
+    detailsHtml += `
+      <div class="exec-item ${cls}">
+        <div class="exec-header"><span class="exec-icon">${icon}</span> ${escapeHtml(exec.machine_name)}: <code>${escapeHtml(exec.command)}</code></div>
+        <pre class="exec-output">${escapeHtml(shortOutput)}</pre>
+      </div>`;
+  }
+
+  return `
+    <details class="tool-exec-summary">
+      <summary>${label}</summary>
+      <div class="exec-details">${detailsHtml}</div>
+    </details>`;
+}
+
+

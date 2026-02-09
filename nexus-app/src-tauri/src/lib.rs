@@ -1,10 +1,11 @@
 // Project Nexus — Tauri Backend
-// Phase 3: Context Monitoring + Token Tracking
+// Phase 3-B: Tool Use Integration
 // - HTTP direct call (no subprocess, no audio glitch)
 // - Conversation history management
 // - Model switching support
 // - Real token usage tracking from API response
 // - Cost estimation and context warnings
+// - Tool Use: Claude が自律的にSSHコマンドを実行
 
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
@@ -12,43 +13,66 @@ use std::time::Duration;
 use tauri::{
     menu::{MenuBuilder, MenuItemBuilder},
     tray::TrayIconBuilder,
-    Manager, State, WindowEvent,
+    Emitter, Manager, State, WindowEvent,
 };
 use tokio::process::Command as TokioCommand;
 use tokio::time::timeout;
 
+/// バイト列をUTF-8として解釈し、失敗したらShift-JIS→EUC-JPの順で試行
+fn decode_bytes(bytes: &[u8]) -> String {
+    // まずUTF-8を試す
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return s.to_string();
+    }
+    // Shift-JIS (CP932) を試す
+    let (decoded, _, had_errors) = encoding_rs::SHIFT_JIS.decode(bytes);
+    if !had_errors {
+        return decoded.to_string();
+    }
+    // EUC-JP を試す
+    let (decoded, _, had_errors) = encoding_rs::EUC_JP.decode(bytes);
+    if !had_errors {
+        return decoded.to_string();
+    }
+    // 全部ダメならlossyで
+    String::from_utf8_lossy(bytes).to_string()
+}
+
 // ========================================
-// Anthropic API Types
+// Anthropic API Types (Tool Use対応)
 // ========================================
 
+/// 履歴用メッセージ（テキストのみ保持、トークン節約）
 #[derive(Serialize, Clone)]
-struct ApiMessage {
+struct HistoryMessage {
     role: String,
     content: String,
 }
 
+/// API送信用リクエスト（tools / system 対応）
 #[derive(Serialize)]
 struct ApiRequest {
     model: String,
     max_tokens: u32,
-    messages: Vec<ApiMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system: Option<String>,
+    messages: Vec<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<serde_json::Value>>,
 }
 
-#[derive(Deserialize)]
+/// APIレスポンス
+#[derive(Deserialize, Debug)]
 struct ApiResponse {
-    content: Vec<ContentBlock>,
+    content: Vec<serde_json::Value>,
     usage: Option<UsageInfo>,
+    stop_reason: Option<String>,
 }
 
-#[derive(Deserialize, Serialize, Clone, Default)]
+#[derive(Deserialize, Serialize, Clone, Default, Debug)]
 struct UsageInfo {
     input_tokens: u64,
     output_tokens: u64,
-}
-
-#[derive(Deserialize)]
-struct ContentBlock {
-    text: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -59,6 +83,31 @@ struct ApiError {
 #[derive(Deserialize)]
 struct ApiErrorDetail {
     message: Option<String>,
+}
+
+/// ツール実行結果（フロントエンドに返す）
+#[derive(Serialize, Clone, Debug)]
+struct ToolExecution {
+    machine_name: String,
+    command: String,
+    stdout: String,
+    stderr: String,
+    success: bool,
+}
+
+/// ツール実行中イベント（Tauriイベント経由でフロントへ）
+#[derive(Serialize, Clone, Debug)]
+struct ToolExecutingEvent {
+    machine_name: String,
+    command: String,
+}
+
+/// ツール実行完了イベント
+#[derive(Serialize, Clone, Debug)]
+struct ToolCompletedEvent {
+    machine_name: String,
+    command: String,
+    success: bool,
 }
 
 // ========================================
@@ -75,7 +124,7 @@ struct TokenStats {
 }
 
 struct ChatState {
-    history: Vec<ApiMessage>,
+    history: Vec<HistoryMessage>,
     model: String,
     token_stats: TokenStats,
 }
@@ -91,63 +140,167 @@ impl Default for ChatState {
 }
 
 const MAX_HISTORY: usize = 20; // 直近20メッセージを保持
+const MAX_TOOL_LOOPS: usize = 5; // Tool Use最大ループ回数（暴走防止）
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
 
 // ========================================
 // Tauri Commands
 // ========================================
 
-/// Response from send_message including token usage
+/// Response from send_message including token usage and tool executions
 #[derive(Serialize)]
 struct SendMessageResponse {
     text: String,
     token_stats: TokenStats,
+    tool_executions: Vec<ToolExecution>,
 }
 
-/// Send a message via Anthropic API (non-streaming)
-#[tauri::command]
-async fn send_message(
-    message: String,
-    state: State<'_, Mutex<ChatState>>,
-) -> Result<SendMessageResponse, String> {
-    let api_key = std::env::var("ANTHROPIC_API_KEY")
-        .map_err(|_| "ANTHROPIC_API_KEY 環境変数が設定されていません".to_string())?;
+// ========================================
+// Tool Use — ヘルパー関数
+// ========================================
 
-    // Build messages list from history
-    let messages = {
-        let mut chat = state.lock().map_err(|e| format!("State lock error: {}", e))?;
+/// 利用可能なマシンからツール定義を動的生成
+fn build_tools(machines: &[SshMachineConfig]) -> Vec<serde_json::Value> {
+    let machine_names: Vec<String> = machines
+        .iter()
+        .filter(|m| m.enabled && m.role != "Commander")
+        .map(|m| m.name.clone())
+        .collect();
 
-        // Add user message to history
-        chat.history.push(ApiMessage {
-            role: "user".to_string(),
-            content: message,
-        });
+    if machine_names.is_empty() {
+        return vec![];
+    }
 
-        // Trim history to last N messages
-        if chat.history.len() > MAX_HISTORY {
-            let drain_count = chat.history.len() - MAX_HISTORY;
-            chat.history.drain(..drain_count);
+    vec![serde_json::json!({
+        "name": "execute_remote_command",
+        "description": "リモートマシンでシェルコマンドを実行する。ディスク容量、プロセス確認、サービス状態など、システム情報の取得や管理タスクに使用。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "machine_name": {
+                    "type": "string",
+                    "description": format!("対象マシン名。利用可能: {}", machine_names.join(", ")),
+                    "enum": machine_names
+                },
+                "command": {
+                    "type": "string",
+                    "description": "実行するシェルコマンド（例: df -h, free -m, systemctl status nginx）"
+                }
+            },
+            "required": ["machine_name", "command"]
         }
+    })]
+}
 
-        chat.history.clone()
+/// システムプロンプト生成（マシン情報を注入）
+fn build_system_prompt(machines: &[SshMachineConfig]) -> String {
+    let machine_info: Vec<String> = machines
+        .iter()
+        .map(|m| {
+            let status = if m.role == "Commander" {
+                "ローカル（自分自身）"
+            } else if m.enabled {
+                "SSH接続可能"
+            } else {
+                "無効"
+            };
+            format!("- {}: {} [{}]", m.name, m.role, status)
+        })
+        .collect();
+
+    format!(
+        "あなたはProject Nexusのシステム管理アシスタントです。\n\
+         以下のマシンをSSH経由でリモート管理できます：\n{}\n\n\
+         ユーザーの指示に応じて execute_remote_command ツールで適切なコマンドを実行し、\n\
+         結果を日本語で分かりやすく説明してください。\n\
+         コマンド実行が不要な質問には通常通り回答してください。",
+        machine_info.join("\n")
+    )
+}
+
+/// ツール実行（SSH経由）
+async fn execute_tool_ssh(
+    machine_name: &str,
+    command: &str,
+    machines: &[SshMachineConfig],
+) -> ToolExecution {
+    let machine = machines
+        .iter()
+        .find(|m| m.name == machine_name && m.enabled && m.role != "Commander");
+
+    let Some(machine) = machine else {
+        return ToolExecution {
+            machine_name: machine_name.to_string(),
+            command: command.to_string(),
+            stdout: String::new(),
+            stderr: format!("マシン '{}' が見つからないか無効です", machine_name),
+            success: false,
+        };
     };
 
-    let model = {
-        let chat = state.lock().map_err(|e| format!("State lock error: {}", e))?;
-        chat.model.clone()
-    };
+    let result = timeout(
+        Duration::from_secs(30),
+        TokioCommand::new("ssh")
+            .args([
+                "-o", "BatchMode=yes",
+                "-o", "ConnectTimeout=5",
+                &machine.host,
+                command,
+            ])
+            .output(),
+    )
+    .await;
 
-    // Call Anthropic API
+    match result {
+        Ok(Ok(output)) => ToolExecution {
+            machine_name: machine_name.to_string(),
+            command: command.to_string(),
+            stdout: decode_bytes(&output.stdout),
+            stderr: decode_bytes(&output.stderr),
+            success: output.status.success(),
+        },
+        Ok(Err(e)) => ToolExecution {
+            machine_name: machine_name.to_string(),
+            command: command.to_string(),
+            stdout: String::new(),
+            stderr: format!("SSH実行エラー: {}", e),
+            success: false,
+        },
+        Err(_) => ToolExecution {
+            machine_name: machine_name.to_string(),
+            command: command.to_string(),
+            stdout: String::new(),
+            stderr: "タイムアウト（30秒）".to_string(),
+            success: false,
+        },
+    }
+}
+
+/// Anthropic API呼び出し（共通）
+async fn call_anthropic(
+    api_key: &str,
+    model: &str,
+    system: &str,
+    tools: &[serde_json::Value],
+    messages: &[serde_json::Value],
+) -> Result<ApiResponse, String> {
     let client = reqwest::Client::new();
+
     let body = ApiRequest {
-        model,
+        model: model.to_string(),
         max_tokens: 4096,
-        messages,
+        system: Some(system.to_string()),
+        messages: messages.to_vec(),
+        tools: if tools.is_empty() {
+            None
+        } else {
+            Some(tools.to_vec())
+        },
     };
 
     let response = client
         .post(API_URL)
-        .header("x-api-key", &api_key)
+        .header("x-api-key", api_key)
         .header("anthropic-version", "2023-06-01")
         .header("content-type", "application/json")
         .json(&body)
@@ -162,7 +315,6 @@ async fn send_message(
         .map_err(|e| format!("レスポンス読み取りエラー: {}", e))?;
 
     if !status.is_success() {
-        // Try to parse error message
         if let Ok(err) = serde_json::from_str::<ApiError>(&response_text) {
             if let Some(detail) = err.error {
                 return Err(format!(
@@ -175,56 +327,267 @@ async fn send_message(
         return Err(format!("API Error ({}): {}", status, response_text));
     }
 
-    // Parse success response
-    let api_resp: ApiResponse = serde_json::from_str(&response_text)
-        .map_err(|e| format!("レスポンスパースエラー: {}", e))?;
+    serde_json::from_str(&response_text)
+        .map_err(|e| format!("レスポンスパースエラー: {} / body: {}", e, &response_text[..200.min(response_text.len())]))
+}
 
-    let assistant_text = api_resp
-        .content
-        .into_iter()
-        .filter_map(|block| block.text)
-        .collect::<Vec<_>>()
-        .join("");
+// ========================================
+// Tauri Commands
+// ========================================
 
-    if assistant_text.is_empty() {
-        return Ok(SendMessageResponse {
-            text: "(空の応答が返されました)".to_string(),
-            token_stats: TokenStats::default(),
+/// Send a message via Anthropic API with Tool Use support
+#[tauri::command]
+async fn send_message(
+    message: String,
+    state: State<'_, Mutex<ChatState>>,
+    ssh_state: State<'_, Mutex<SshState>>,
+    app_handle: tauri::AppHandle,
+) -> Result<SendMessageResponse, String> {
+    let api_key = std::env::var("ANTHROPIC_API_KEY")
+        .map_err(|_| "ANTHROPIC_API_KEY 環境変数が設定されていません".to_string())?;
+
+    // マシン情報からツール定義とシステムプロンプトを生成
+    let (tools, system_prompt, machines) = {
+        let ssh = ssh_state.lock().map_err(|e| format!("Lock error: {}", e))?;
+        (
+            build_tools(&ssh.machines),
+            build_system_prompt(&ssh.machines),
+            ssh.machines.clone(),
+        )
+    };
+
+    // 履歴からAPIメッセージ配列を構築
+    let mut api_messages: Vec<serde_json::Value> = {
+        let mut chat = state.lock().map_err(|e| format!("State lock error: {}", e))?;
+
+        // ユーザーメッセージを履歴に追加
+        chat.history.push(HistoryMessage {
+            role: "user".to_string(),
+            content: message.clone(),
         });
+
+        // 履歴をトリム
+        if chat.history.len() > MAX_HISTORY {
+            let drain_count = chat.history.len() - MAX_HISTORY;
+            chat.history.drain(..drain_count);
+        }
+
+        // 履歴を API メッセージ形式に変換
+        chat.history
+            .iter()
+            .map(|m| {
+                serde_json::json!({
+                    "role": m.role,
+                    "content": m.content
+                })
+            })
+            .collect()
+    };
+
+    let model = {
+        let chat = state.lock().map_err(|e| format!("State lock error: {}", e))?;
+        chat.model.clone()
+    };
+
+    // ========================================
+    // Tool Use ループ
+    // ========================================
+    let mut all_text_parts: Vec<String> = Vec::new();
+    let mut all_tool_executions: Vec<ToolExecution> = Vec::new();
+    let mut total_usage = UsageInfo::default();
+    let mut last_call_input_tokens: u64 = 0; // コンテキスト使用率計算用（最後のAPIコールのみ）
+
+    for loop_count in 0..MAX_TOOL_LOOPS {
+        let api_resp =
+            call_anthropic(&api_key, &model, &system_prompt, &tools, &api_messages).await?;
+
+        // トークン使用量を累積
+        if let Some(usage) = &api_resp.usage {
+            total_usage.input_tokens += usage.input_tokens;
+            total_usage.output_tokens += usage.output_tokens;
+            last_call_input_tokens = usage.input_tokens; // 最新のAPIコールのinput_tokensを記録
+        }
+
+        // レスポンスのcontentブロックを解析
+        let mut tool_uses: Vec<(String, String, serde_json::Value)> = Vec::new(); // (id, name, input)
+
+        for block in &api_resp.content {
+            if let Some(block_type) = block.get("type").and_then(|t| t.as_str()) {
+                match block_type {
+                    "text" => {
+                        if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                            all_text_parts.push(text.to_string());
+                        }
+                    }
+                    "tool_use" => {
+                        let id = block
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let name = block
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let input = block
+                            .get("input")
+                            .cloned()
+                            .unwrap_or(serde_json::json!({}));
+                        tool_uses.push((id, name, input));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // アシスタント応答をメッセージ配列に追加（tool_useブロック含む）
+        api_messages.push(serde_json::json!({
+            "role": "assistant",
+            "content": api_resp.content
+        }));
+
+        // ツール呼び出しがなければ終了
+        if tool_uses.is_empty() || api_resp.stop_reason.as_deref() != Some("tool_use") {
+            break;
+        }
+
+        // ループ上限チェック
+        if loop_count >= MAX_TOOL_LOOPS - 1 {
+            all_text_parts
+                .push("\n⚠️ ツール実行回数が上限に達しました。".to_string());
+            break;
+        }
+
+        // ツール実行
+        let mut tool_results: Vec<serde_json::Value> = Vec::new();
+
+        for (tool_id, tool_name, tool_input) in &tool_uses {
+            let machine_name = tool_input
+                .get("machine_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let command = tool_input
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            // フロントエンドに実行中イベントを送信
+            let _ = app_handle.emit(
+                "tool-executing",
+                ToolExecutingEvent {
+                    machine_name: machine_name.to_string(),
+                    command: command.to_string(),
+                },
+            );
+
+            if tool_name == "execute_remote_command" {
+                let exec_result = execute_tool_ssh(machine_name, command, &machines).await;
+
+                // 実行完了イベント
+                let _ = app_handle.emit(
+                    "tool-completed",
+                    ToolCompletedEvent {
+                        machine_name: machine_name.to_string(),
+                        command: command.to_string(),
+                        success: exec_result.success,
+                    },
+                );
+
+                // tool_resultの content を構築
+                let result_text = if exec_result.success {
+                    if exec_result.stdout.is_empty() {
+                        "(コマンド成功・出力なし)".to_string()
+                    } else {
+                        exec_result.stdout.clone()
+                    }
+                } else {
+                    format!(
+                        "エラー: {}{}",
+                        exec_result.stderr,
+                        if !exec_result.stdout.is_empty() {
+                            format!("\nstdout: {}", exec_result.stdout)
+                        } else {
+                            String::new()
+                        }
+                    )
+                };
+
+                tool_results.push(serde_json::json!({
+                    "type": "tool_result",
+                    "tool_use_id": tool_id,
+                    "content": result_text,
+                    "is_error": !exec_result.success
+                }));
+
+                all_tool_executions.push(exec_result);
+            } else {
+                // 未知のツール
+                tool_results.push(serde_json::json!({
+                    "type": "tool_result",
+                    "tool_use_id": tool_id,
+                    "content": format!("未知のツール: {}", tool_name),
+                    "is_error": true
+                }));
+            }
+        }
+
+        // ツール結果をuserメッセージとして追加
+        api_messages.push(serde_json::json!({
+            "role": "user",
+            "content": tool_results
+        }));
     }
 
-    // Update token stats and add assistant response to history
+    // 最終テキスト
+    let final_text = all_text_parts.join("");
+    let final_text = if final_text.is_empty() {
+        "(空の応答が返されました)".to_string()
+    } else {
+        final_text
+    };
+
+    // 履歴とトークン統計を更新（最終テキストのみ保存）
     let current_stats = {
         let mut chat = state.lock().map_err(|e| format!("State lock error: {}", e))?;
 
-        // Update token stats from usage info
-        if let Some(usage) = &api_resp.usage {
-            chat.token_stats.last_input_tokens = usage.input_tokens;
-            chat.token_stats.last_output_tokens = usage.output_tokens;
-            chat.token_stats.total_input_tokens += usage.input_tokens;
-            chat.token_stats.total_output_tokens += usage.output_tokens;
-            chat.token_stats.request_count += 1;
-        }
+        chat.token_stats.last_input_tokens = last_call_input_tokens; // コンテキスト%用: 最後のAPIコールのみ
+        chat.token_stats.last_output_tokens = total_usage.output_tokens;
+        chat.token_stats.total_input_tokens += total_usage.input_tokens; // コスト計算用: 全ループ合計
+        chat.token_stats.total_output_tokens += total_usage.output_tokens;
+        chat.token_stats.request_count += 1;
 
-        chat.history.push(ApiMessage {
+        // アシスタント応答を履歴に追加（テキストのみ）
+        chat.history.push(HistoryMessage {
             role: "assistant".to_string(),
-            content: assistant_text.clone(),
+            content: final_text.clone(),
         });
 
         chat.token_stats.clone()
     };
 
     Ok(SendMessageResponse {
-        text: assistant_text,
+        text: final_text,
         token_stats: current_stats,
+        tool_executions: all_tool_executions,
     })
 }
 
-/// Clear conversation history and reset token stats
+/// Clear conversation history (コスト累計は保持)
 #[tauri::command]
 fn clear_history(state: State<'_, Mutex<ChatState>>) -> Result<(), String> {
     let mut chat = state.lock().map_err(|e| format!("State lock error: {}", e))?;
     chat.history.clear();
+    // コンテキスト関連のみリセット、コスト累計は保持
+    chat.token_stats.last_input_tokens = 0;
+    chat.token_stats.last_output_tokens = 0;
+    Ok(())
+}
+
+/// コスト累計をリセット
+#[tauri::command]
+fn reset_cost(state: State<'_, Mutex<ChatState>>) -> Result<(), String> {
+    let mut chat = state.lock().map_err(|e| format!("State lock error: {}", e))?;
     chat.token_stats = TokenStats::default();
     Ok(())
 }
@@ -420,8 +783,8 @@ async fn execute_remote_command(
     match result {
         Ok(Ok(output)) => Ok(RemoteCommandResult {
             success: output.status.success(),
-            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            stdout: decode_bytes(&output.stdout),
+            stderr: decode_bytes(&output.stderr),
             exit_code: output.status.code().unwrap_or(-1),
         }),
         Ok(Err(e)) => Err(format!("SSH実行エラー: {}", e)),
@@ -495,6 +858,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             send_message,
             clear_history,
+            reset_cost,
             set_model,
             get_current_model,
             get_machine_status,

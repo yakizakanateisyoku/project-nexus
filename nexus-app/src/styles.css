@@ -397,7 +397,7 @@ html, body {
   font-family: inherit;
   line-height: 1.5;
   resize: none;
-  max-height: 120px;
+  max-height: 200px;
   overflow-y: auto;
 }
 
@@ -618,4 +618,166 @@ html, body {
 
 .remote-output .cmd-success {
   color: var(--online);
+}
+
+/* ========================================
+   Phase 3-B: Tool Use — Status & Summary
+   ======================================== */
+
+/* Message layout: stack children vertically for tool summary support */
+.message.assistant {
+  flex-direction: column;
+}
+
+/* Ephemeral tool status message (during execution) */
+.tool-status-message {
+  max-width: 90%;
+}
+
+.tool-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  border-radius: 10px;
+  font-size: 13px;
+  font-family: 'Consolas', 'Courier New', monospace;
+}
+
+.tool-status.executing {
+  background: rgba(77, 171, 247, 0.1);
+  border: 1px solid rgba(77, 171, 247, 0.25);
+  color: var(--accent);
+}
+
+.tool-status.success {
+  background: rgba(81, 207, 102, 0.1);
+  border: 1px solid rgba(81, 207, 102, 0.25);
+  color: var(--online);
+}
+
+.tool-status.error {
+  background: rgba(255, 107, 107, 0.1);
+  border: 1px solid rgba(255, 107, 107, 0.25);
+  color: var(--danger);
+}
+
+.tool-status code {
+  background: rgba(255, 255, 255, 0.06);
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 12px;
+}
+
+.tool-spinner {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border: 2px solid transparent;
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* Tool Execution Summary (collapsible) */
+.tool-exec-summary {
+  margin-top: 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  font-size: 13px;
+}
+
+.tool-exec-summary summary {
+  padding: 6px 12px;
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  cursor: pointer;
+  user-select: none;
+  font-size: 12px;
+  transition: background 0.15s;
+}
+
+.tool-exec-summary summary:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.tool-exec-summary[open] summary {
+  border-bottom: 1px solid var(--border);
+}
+
+.exec-details {
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.exec-item {
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 12px;
+}
+
+.exec-item.exec-success {
+  background: rgba(81, 207, 102, 0.05);
+  border-left: 3px solid var(--online);
+}
+
+.exec-item.exec-error {
+  background: rgba(255, 107, 107, 0.05);
+  border-left: 3px solid var(--danger);
+}
+
+.exec-header {
+  font-family: 'Consolas', 'Courier New', monospace;
+  color: var(--text-primary);
+  margin-bottom: 4px;
+}
+
+.exec-header code {
+  background: rgba(255, 255, 255, 0.06);
+  padding: 1px 5px;
+  border-radius: 3px;
+}
+
+.exec-icon {
+  font-weight: 700;
+}
+
+.exec-success .exec-icon {
+  color: var(--online);
+}
+
+.exec-error .exec-icon {
+  color: var(--danger);
+}
+
+.exec-output {
+  margin: 0;
+  padding: 6px 8px;
+  background: var(--bg-primary);
+  border-radius: 4px;
+  font-size: 11px;
+  font-family: 'Consolas', 'Courier New', monospace;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 150px;
+  overflow-y: auto;
+  line-height: 1.4;
+}
+
+.exec-output::-webkit-scrollbar {
+  width: 4px;
+}
+
+.exec-output::-webkit-scrollbar-thumb {
+  background: var(--bg-hover);
+  border-radius: 2px;
 }
