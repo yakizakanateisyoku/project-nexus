@@ -1,6 +1,6 @@
 // ========================================
 // Project Nexus — Chat UI Controller
-// Phase 3: Context Monitoring + Token Tracking
+// Phase 3: Context Monitoring + Token Tracking + Remote Management
 // ========================================
 
 const { invoke } = window.__TAURI__.core;
@@ -11,12 +11,22 @@ let chatInputEl;
 let chatFormEl;
 let sendBtnEl;
 let contextBadgeEl;
+let machineListEl;
+let remotePanelEl;
+let remoteTargetLabel;
+let remoteCmdInput;
+let remoteExecBtn;
+let remoteOutputEl;
 
 // State
 let isProcessing = false;
 let messageHistory = [];
 let currentTokenStats = null;
 let currentModel = "claude-sonnet-4-5-20250929";
+let selectedRemoteMachine = null;
+let machineStatuses = [];
+let statusPollTimer = null;
+const STATUS_POLL_INTERVAL = 15000; // 15秒間隔（軽量化）
 
 // Model pricing (per million tokens)
 const MODEL_PRICING = {
@@ -37,6 +47,12 @@ window.addEventListener("DOMContentLoaded", () => {
   chatFormEl = document.getElementById("chat-form");
   sendBtnEl = document.getElementById("send-btn");
   contextBadgeEl = document.getElementById("context-badge");
+  machineListEl = document.getElementById("machine-list");
+  remotePanelEl = document.getElementById("remote-panel");
+  remoteTargetLabel = document.getElementById("remote-target-label");
+  remoteCmdInput = document.getElementById("remote-cmd-input");
+  remoteExecBtn = document.getElementById("remote-exec-btn");
+  remoteOutputEl = document.getElementById("remote-output");
 
   // Form submit
   chatFormEl.addEventListener("submit", (e) => {
@@ -59,7 +75,6 @@ window.addEventListener("DOMContentLoaded", () => {
   // Model selector
   const modelSelect = document.getElementById("model-select");
   if (modelSelect) {
-    // Load current model
     invoke("get_current_model").then((model) => {
       modelSelect.value = model;
       currentModel = model;
@@ -72,7 +87,6 @@ window.addEventListener("DOMContentLoaded", () => {
         addMessage("system", result);
       } catch (err) {
         addMessage("system", `Error: ${err}`);
-        // Revert selector
         const current = await invoke("get_current_model");
         modelSelect.value = current;
         currentModel = current;
@@ -97,6 +111,19 @@ window.addEventListener("DOMContentLoaded", () => {
       }
     });
   }
+
+  // Remote command panel
+  remoteExecBtn.addEventListener("click", handleRemoteExec);
+  remoteCmdInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      handleRemoteExec();
+    }
+  });
+
+  // Initial machine status + start polling
+  refreshMachineStatus();
+  statusPollTimer = setInterval(refreshMachineStatus, STATUS_POLL_INTERVAL);
 
   chatInputEl.focus();
 });
@@ -288,4 +315,105 @@ function showContextWarning(text, level) {
 function removeContextWarning() {
   const existing = document.getElementById("context-warning");
   if (existing) existing.remove();
+}
+
+// ========================================
+// Phase 3: Machine Status & Remote Exec
+// ========================================
+
+async function refreshMachineStatus() {
+  try {
+    // ポーリング中はdotをchecking状態に
+    const dots = machineListEl.querySelectorAll(".status-dot");
+    dots.forEach((d) => d.classList.add("checking"));
+
+    const statuses = await invoke("get_machine_status");
+    machineStatuses = statuses;
+    renderMachineList(statuses);
+  } catch (err) {
+    console.error("Machine status poll error:", err);
+  }
+}
+
+function renderMachineList(statuses) {
+  machineListEl.innerHTML = "";
+  for (const m of statuses) {
+    const div = document.createElement("div");
+    const isOnline = m.online;
+    const isRemote = m.role !== "Commander";
+    const isSelected = selectedRemoteMachine === m.name;
+
+    div.className = `machine-item ${isOnline ? "online" : "offline"}${isRemote ? " selectable" : ""}${isSelected ? " selected" : ""}`;
+
+    div.innerHTML = `
+      <span class="status-dot"></span>
+      <div class="machine-info">
+        <span class="machine-name">${m.name}</span>
+        <span class="machine-role">${m.role}</span>
+      </div>`;
+
+    if (isRemote) {
+      div.addEventListener("click", () => selectRemoteMachine(m.name, isOnline));
+    }
+
+    machineListEl.appendChild(div);
+  }
+}
+
+function selectRemoteMachine(name, isOnline) {
+  if (selectedRemoteMachine === name) {
+    // 同じマシンをクリック→選択解除
+    selectedRemoteMachine = null;
+    remotePanelEl.style.display = "none";
+    remoteOutputEl.textContent = "";
+  } else {
+    selectedRemoteMachine = name;
+    remotePanelEl.style.display = "block";
+    remoteTargetLabel.textContent = `${name}${isOnline ? "" : " (offline)"}`;
+    remoteOutputEl.textContent = "";
+    remoteCmdInput.value = "";
+    remoteCmdInput.focus();
+  }
+  // リスト再描画で選択状態を反映
+  renderMachineList(machineStatuses);
+}
+
+async function handleRemoteExec() {
+  if (!selectedRemoteMachine) return;
+  const cmd = remoteCmdInput.value.trim();
+  if (!cmd) return;
+
+  remoteExecBtn.disabled = true;
+  remoteOutputEl.innerHTML = '<span style="color:var(--text-muted)">実行中...</span>';
+
+  try {
+    const result = await invoke("execute_remote_command", {
+      machineName: selectedRemoteMachine,
+      command: cmd,
+    });
+
+    let html = "";
+    if (result.stdout) {
+      html += `<span class="cmd-success">${escapeHtml(result.stdout)}</span>`;
+    }
+    if (result.stderr) {
+      html += `<span class="cmd-error">${escapeHtml(result.stderr)}</span>`;
+    }
+    if (!result.stdout && !result.stderr) {
+      html = `<span class="cmd-success">exit: ${result.exit_code}</span>`;
+    }
+    remoteOutputEl.innerHTML = html;
+  } catch (err) {
+    remoteOutputEl.innerHTML = `<span class="cmd-error">${escapeHtml(String(err))}</span>`;
+  } finally {
+    remoteExecBtn.disabled = false;
+    remoteCmdInput.value = "";
+    remoteCmdInput.focus();
+  }
+}
+
+function escapeHtml(text) {
+  const div = document.createElement("div");
+  div.textContent = text;
+  return div.innerHTML;
 }

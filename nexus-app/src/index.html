@@ -19,29 +19,20 @@
         <!-- PC Status -->
         <div class="section">
           <div class="section-title">MACHINES</div>
-          <div class="machine-list">
-            <div class="machine-item online">
-              <span class="status-dot"></span>
-              <div class="machine-info">
-                <span class="machine-name">OMEN</span>
-                <span class="machine-role">Commander</span>
-              </div>
-            </div>
-            <div class="machine-item offline">
-              <span class="status-dot"></span>
-              <div class="machine-info">
-                <span class="machine-name">SIGMA</span>
-                <span class="machine-role">Remote</span>
-              </div>
-            </div>
-            <div class="machine-item offline">
-              <span class="status-dot"></span>
-              <div class="machine-info">
-                <span class="machine-name">Precision</span>
-                <span class="machine-role">Remote</span>
-              </div>
-            </div>
+          <div class="machine-list" id="machine-list">
+            <!-- 動的に生成 -->
           </div>
+        </div>
+
+        <!-- Remote Command Panel -->
+        <div class="section remote-panel" id="remote-panel" style="display:none;">
+          <div class="section-title">REMOTE EXEC</div>
+          <div class="remote-target" id="remote-target-label">—</div>
+          <div class="remote-input-wrap">
+            <input type="text" id="remote-cmd-input" class="remote-cmd-input" placeholder="command..." />
+            <button id="remote-exec-btn" class="remote-exec-btn" title="Execute">▶</button>
+          </div>
+          <div class="remote-output" id="remote-output"></div>
         </div>
 
         <!-- Sessions -->
