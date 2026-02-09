@@ -1,6 +1,6 @@
 # Project Nexus — 引き継ぎ資料
 
-> **最終更新**: 2026-02-10 (commit 7185c65)
+> **最終更新**: 2026-02-10 (Phase 3-B SIGMA SSH完了)
 > **リポジトリ**: https://github.com/yakizakanateisyoku/project-nexus
 > **作業PC**: OMEN（Commander）
 
@@ -22,7 +22,7 @@ SSH経由でリモート制御し、複数PCでAIタスクを分散実行する�
 | 2 | Anthropic API直接統合・会話管理 | ✅ 完了 |
 | 3-A | SSH基盤構築（OMEN側） | ✅ 完了 |
 | 3-C | UI拡張（マシン監視・リモート実行） | ✅ 完了 |
-| 3-B | リモートPC環境セットアップ | ⬜ 未着手（物理アクセス必要） |
+| 3-B | リモートPC環境セットアップ | 🔶 進行中（SIGMA SSH完了、Precision未着手） |
 | 4 | スマート機能（ストリーミング等） | ⬜ 予定 |
 | 5 | マルチAI連携（GPT-4o, Gemini） | ⬜ 予定 |
 | 6 | 磨き込み（Notion連携, UI/UX） | ⬜ 予定 |
@@ -63,29 +63,48 @@ SSH経由でリモート制御し、複数PCでAIタスクを分散実行する�
 - **リモートコマンドパネル**: 選択マシンへのコマンド入力・実行・結果表示
 - **ビジュアル**: パルスアニメーション(checking)、stdout緑/stderr赤
 
-## Phase 3-B ⬜ リモートPC環境セットアップ（物理アクセス必要）
+## Phase 3-B 🔶 リモートPC環境セットアップ
 
-- ⬜ SIGMA: OpenSSH Server有効化、公開鍵配置
-- ⬜ SIGMA: Node.js, Claude Code インストール
-- ⬜ Precision: OpenSSH Server有効化、公開鍵配置
-- ⬜ Precision: Node.js, Claude Code インストール
-- ⬜ OMEN → SIGMA/Precision SSH鍵認証テスト
+### SIGMA（LattePanda Sigma） — SSH ✅ 完了
+- ✅ OpenSSH Server有効化・ファイアウォール設定
+- ✅ Ed25519公開鍵配置（authorized_keys）
+- ✅ OMEN → SIGMA SSH鍵認証テスト通過
+- ⬜ Node.js インストール
+- ⬜ Claude Code インストール
 
-### SSH接続情報（予定）
+### Precision（Dell Precision） — 未着手
+- ⬜ OpenSSH Server有効化、公開鍵配置
+- ⬜ Node.js, Claude Code インストール
+- ⬜ OMEN → Precision SSH鍵認証テスト
+
+### SSH接続情報（確定）
 ```
-# ~/.ssh/config に追記
+# OMEN ~/.ssh/config
 Host sigma
-    HostName [SIGMA_IP]
-    User [USER]
+    HostName 192.168.1.3
+    User annih
     IdentityFile ~/.ssh/nexus_key
     StrictHostKeyChecking no
 
 Host precision
-    HostName [PRECISION_IP]
-    User [USER]
+    HostName [未設定]
+    User [未設定]
     IdentityFile ~/.ssh/nexus_key
     StrictHostKeyChecking no
 ```
+
+### SSH鍵情報
+- **鍵タイプ**: Ed25519
+- **秘密鍵**: `C:\Users\annih\.ssh\nexus_key`（OMEN）
+- **Fingerprint**: `SHA256:m5fMk4aAZTXpVaXgm6fh2CUwnZYLKqIMQzMkiR9sSGU`
+- **公開鍵**: `ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOpINTEFnit6yZ9axzEesX1VKSk4Ft/LlRaLVeN+F2ky nexus@omen`
+
+### ⚠️ Windows SSH 教訓（SIGMA構築時）
+1. **PowerShell 5.x UTF-8 = BOM付き**: `Set-Content -Encoding UTF8` はBOMを付加する。SSH設定ファイルには `[System.Text.UTF8Encoding]::new($false)` を使うこと
+2. **sshd_configのBOM**: sshdが "Unknown error [preauth]" で無言で失敗する。最も発見が困難なエラー
+3. **StrictModes**: Windows環境ではACL構造との相性が悪い。`StrictModes no` に設定済み（SIGMA）
+4. **authorized_keys**: `C:\Users\<user>\.ssh\authorized_keys` に配置（管理者グループユーザーでもadministrators_authorized_keysは不使用 — Match Groupをコメントアウト済み）
+5. **Precision構築時**: 同じ公開鍵をデプロイし、sshd_configは最初からBOMなしで作成すること
 
 ---
 
@@ -139,6 +158,13 @@ project-nexus/
 - **APIキー**: `.env` ファイル → `dotenvy` → `ANTHROPIC_API_KEY`
 - **PATH競合注意**: Claude Desktop (`claude.exe`) と Claude Code CLI (`claude.cmd`) が共存
 - **コスト意識**: Haiku 4.5デフォルト候補（入力$0.80/M vs Sonnet $3.0/M）
+
+### ネットワーク情報
+| マシン | IP | ホスト名 | 役割 |
+|--------|-----|---------|------|
+| OMEN | 192.168.1.13 | DESKTOP-F8TVJN2 | Commander（メイン） |
+| SIGMA | 192.168.1.3 | LP-Sigma | Remote（サブ） |
+| Precision | 未設定 | 未設定 | Remote（予定） |
 
 ## コミット履歴
 
