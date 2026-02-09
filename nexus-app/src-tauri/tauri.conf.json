@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "nexus-app",
+  "productName": "Project Nexus",
   "version": "0.1.0",
   "identifier": "com.annih.nexus-app",
   "build": {
@@ -10,9 +10,11 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "nexus-app",
-        "width": 800,
-        "height": 600
+        "title": "Project Nexus",
+        "width": 1000,
+        "height": 700,
+        "minWidth": 600,
+        "minHeight": 400
       }
     ],
     "security": {
