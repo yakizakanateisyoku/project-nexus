@@ -450,3 +450,65 @@ html, body {
 .model-select:focus {
   border-color: var(--accent);
 }
+
+
+/* ========================================
+   Phase 3: Context Monitoring Styles
+   ======================================== */
+
+/* Cost Badge */
+.cost-badge {
+  padding: 4px 10px;
+  border-radius: 12px;
+  background: var(--bg-tertiary);
+  font-size: 12px;
+  color: var(--text-secondary);
+  font-family: 'Consolas', 'Courier New', monospace;
+  cursor: default;
+  margin-right: 6px;
+}
+
+/* Context Warning Banner */
+.context-warning {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 8px 20px;
+  font-size: 13px;
+  animation: slideDown 0.3s ease;
+}
+
+.context-warning.warn {
+  background: rgba(255, 169, 77, 0.1);
+  border-top: 1px solid rgba(255, 169, 77, 0.3);
+  color: #ffa94d;
+}
+
+.context-warning.critical {
+  background: rgba(255, 107, 107, 0.1);
+  border-top: 1px solid rgba(255, 107, 107, 0.3);
+  color: var(--danger);
+}
+
+.warning-new-chat-btn {
+  padding: 4px 12px;
+  border: 1px solid var(--danger);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--danger);
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 0.15s;
+  flex-shrink: 0;
+}
+
+.warning-new-chat-btn:hover {
+  background: var(--danger);
+  color: white;
+}
+
+@keyframes slideDown {
+  from { opacity: 0; transform: translateY(-8px); }
+  to { opacity: 1; transform: translateY(0); }
+}

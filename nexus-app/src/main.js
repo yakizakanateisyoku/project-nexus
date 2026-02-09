@@ -1,6 +1,6 @@
 // ========================================
 // Project Nexus — Chat UI Controller
-// Phase 2: Anthropic API integration
+// Phase 3: Context Monitoring + Token Tracking
 // ========================================
 
 const { invoke } = window.__TAURI__.core;
@@ -15,6 +15,18 @@ let contextBadgeEl;
 // State
 let isProcessing = false;
 let messageHistory = [];
+let currentTokenStats = null;
+let currentModel = "claude-sonnet-4-5-20250929";
+
+// Model pricing (per million tokens)
+const MODEL_PRICING = {
+  "claude-sonnet-4-5-20250929": { input: 3.0, output: 15.0, contextWindow: 200000 },
+  "claude-haiku-4-5-20251001": { input: 0.80, output: 4.0, contextWindow: 200000 },
+};
+
+// Context warning thresholds
+const CONTEXT_WARN_PERCENT = 75;
+const CONTEXT_CRITICAL_PERCENT = 90;
 
 // ========================================
 // Initialization
@@ -50,17 +62,20 @@ window.addEventListener("DOMContentLoaded", () => {
     // Load current model
     invoke("get_current_model").then((model) => {
       modelSelect.value = model;
+      currentModel = model;
     });
 
     modelSelect.addEventListener("change", async (e) => {
       try {
         const result = await invoke("set_model", { modelId: e.target.value });
+        currentModel = e.target.value;
         addMessage("system", result);
       } catch (err) {
         addMessage("system", `Error: ${err}`);
         // Revert selector
         const current = await invoke("get_current_model");
         modelSelect.value = current;
+        currentModel = current;
       }
     });
   }
@@ -73,7 +88,9 @@ window.addEventListener("DOMContentLoaded", () => {
         await invoke("clear_history");
         messagesEl.innerHTML = "";
         messageHistory = [];
-        updateContextBadge();
+        currentTokenStats = null;
+        updateContextBadge(null);
+        removeContextWarning();
         addMessage("system", "会話履歴をクリアしました");
       } catch (err) {
         addMessage("system", `Error: ${err}`);
@@ -98,7 +115,11 @@ async function handleSend() {
 
   try {
     const response = await invoke("send_message", { message: text });
-    addMessage("assistant", response);
+    // Phase 3: response is now { text, token_stats }
+    addMessage("assistant", response.text);
+    currentTokenStats = response.token_stats;
+    updateContextBadge(response.token_stats);
+    checkContextWarning(response.token_stats);
   } catch (err) {
     addMessage("system", `Error: ${err}`);
   } finally {
@@ -174,20 +195,97 @@ function escapeHtml(text) {
   return div.innerHTML;
 }
 
-function updateContextBadge() {
-  const totalChars = messageHistory.reduce((sum, m) => sum + m.content.length, 0);
-  const estimatedTokens = Math.round(totalChars / 4);
-  const maxTokens = 200000;
-  const percent = Math.min(Math.round((estimatedTokens / maxTokens) * 100), 100);
+function updateContextBadge(stats) {
+  const pricing = MODEL_PRICING[currentModel] || MODEL_PRICING["claude-sonnet-4-5-20250929"];
+  const contextWindow = pricing.contextWindow;
 
+  let percent = 0;
+  let costText = "$0.00";
+  let inputTokens = 0;
+
+  if (stats && stats.last_input_tokens > 0) {
+    inputTokens = stats.last_input_tokens;
+    percent = Math.min(Math.round((inputTokens / contextWindow) * 100), 100);
+
+    // Calculate session cost
+    const inputCost = (stats.total_input_tokens / 1_000_000) * pricing.input;
+    const outputCost = (stats.total_output_tokens / 1_000_000) * pricing.output;
+    const totalCost = inputCost + outputCost;
+    costText = `$${totalCost.toFixed(4)}`;
+  }
+
+  // Update badge display
   const textEl = contextBadgeEl.querySelector(".context-text");
   textEl.textContent = `${percent}%`;
 
-  if (percent > 75) {
+  // Update cost display
+  const costEl = document.getElementById("cost-badge");
+  if (costEl) {
+    costEl.textContent = costText;
+  }
+
+  // Update token detail tooltip
+  if (stats) {
+    contextBadgeEl.title = `Context: ${inputTokens.toLocaleString()} / ${contextWindow.toLocaleString()} tokens\n` +
+      `Session: ${stats.total_input_tokens.toLocaleString()} in / ${stats.total_output_tokens.toLocaleString()} out\n` +
+      `Requests: ${stats.request_count}\nCost: ${costText}`;
+  }
+
+  // Color coding
+  if (percent >= CONTEXT_CRITICAL_PERCENT) {
     contextBadgeEl.style.color = "var(--danger)";
-  } else if (percent > 50) {
+  } else if (percent >= CONTEXT_WARN_PERCENT) {
     contextBadgeEl.style.color = "#ffa94d";
   } else {
     contextBadgeEl.style.color = "var(--text-secondary)";
   }
+}
+
+function checkContextWarning(stats) {
+  if (!stats || stats.last_input_tokens === 0) return;
+
+  const pricing = MODEL_PRICING[currentModel] || MODEL_PRICING["claude-sonnet-4-5-20250929"];
+  const percent = Math.round((stats.last_input_tokens / pricing.contextWindow) * 100);
+
+  // Remove existing warning
+  removeContextWarning();
+
+  if (percent >= CONTEXT_CRITICAL_PERCENT) {
+    showContextWarning(
+      "⚠️ コンテキスト使用率が90%を超えました。New Chatで新しい会話を始めることを推奨します。",
+      "critical"
+    );
+  } else if (percent >= CONTEXT_WARN_PERCENT) {
+    showContextWarning(
+      `⚡ コンテキスト使用率 ${percent}% — 会話が長くなっています。`,
+      "warn"
+    );
+  }
+}
+
+function showContextWarning(text, level) {
+  const warningEl = document.createElement("div");
+  warningEl.className = `context-warning ${level}`;
+  warningEl.id = "context-warning";
+  warningEl.innerHTML = `<span>${text}</span>`;
+
+  if (level === "critical") {
+    const btn = document.createElement("button");
+    btn.className = "warning-new-chat-btn";
+    btn.textContent = "New Chat";
+    btn.addEventListener("click", () => {
+      document.getElementById("new-chat-btn").click();
+    });
+    warningEl.appendChild(btn);
+  }
+
+  // Insert before input area
+  const inputArea = document.querySelector(".input-area");
+  inputArea.parentNode.insertBefore(warningEl, inputArea);
+  scrollToBottom();
+}
+
+function removeContextWarning() {
+  const existing = document.getElementById("context-warning");
+  if (existing) existing.remove();
 }

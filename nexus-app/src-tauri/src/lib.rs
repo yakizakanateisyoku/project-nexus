@@ -1,8 +1,10 @@
 // Project Nexus — Tauri Backend
-// Phase 2: Anthropic API Direct Integration
+// Phase 3: Context Monitoring + Token Tracking
 // - HTTP direct call (no subprocess, no audio glitch)
 // - Conversation history management
 // - Model switching support
+// - Real token usage tracking from API response
+// - Cost estimation and context warnings
 
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
@@ -32,6 +34,13 @@ struct ApiRequest {
 #[derive(Deserialize)]
 struct ApiResponse {
     content: Vec<ContentBlock>,
+    usage: Option<UsageInfo>,
+}
+
+#[derive(Deserialize, Serialize, Clone, Default)]
+struct UsageInfo {
+    input_tokens: u64,
+    output_tokens: u64,
 }
 
 #[derive(Deserialize)]
@@ -53,9 +62,19 @@ struct ApiErrorDetail {
 // App State
 // ========================================
 
+#[derive(Serialize, Clone, Default)]
+struct TokenStats {
+    last_input_tokens: u64,
+    last_output_tokens: u64,
+    total_input_tokens: u64,
+    total_output_tokens: u64,
+    request_count: u32,
+}
+
 struct ChatState {
     history: Vec<ApiMessage>,
     model: String,
+    token_stats: TokenStats,
 }
 
 impl Default for ChatState {
@@ -63,6 +82,7 @@ impl Default for ChatState {
         Self {
             history: Vec::new(),
             model: "claude-sonnet-4-5-20250929".to_string(),
+            token_stats: TokenStats::default(),
         }
     }
 }
@@ -74,12 +94,19 @@ const API_URL: &str = "https://api.anthropic.com/v1/messages";
 // Tauri Commands
 // ========================================
 
+/// Response from send_message including token usage
+#[derive(Serialize)]
+struct SendMessageResponse {
+    text: String,
+    token_stats: TokenStats,
+}
+
 /// Send a message via Anthropic API (non-streaming)
 #[tauri::command]
 async fn send_message(
     message: String,
     state: State<'_, Mutex<ChatState>>,
-) -> Result<String, String> {
+) -> Result<SendMessageResponse, String> {
     let api_key = std::env::var("ANTHROPIC_API_KEY")
         .map_err(|_| "ANTHROPIC_API_KEY 環境変数が設定されていません".to_string())?;
 
@@ -157,27 +184,53 @@ async fn send_message(
         .join("");
 
     if assistant_text.is_empty() {
-        return Ok("(空の応答が返されました)".to_string());
+        return Ok(SendMessageResponse {
+            text: "(空の応答が返されました)".to_string(),
+            token_stats: TokenStats::default(),
+        });
     }
 
-    // Add assistant response to history
-    {
+    // Update token stats and add assistant response to history
+    let current_stats = {
         let mut chat = state.lock().map_err(|e| format!("State lock error: {}", e))?;
+
+        // Update token stats from usage info
+        if let Some(usage) = &api_resp.usage {
+            chat.token_stats.last_input_tokens = usage.input_tokens;
+            chat.token_stats.last_output_tokens = usage.output_tokens;
+            chat.token_stats.total_input_tokens += usage.input_tokens;
+            chat.token_stats.total_output_tokens += usage.output_tokens;
+            chat.token_stats.request_count += 1;
+        }
+
         chat.history.push(ApiMessage {
             role: "assistant".to_string(),
             content: assistant_text.clone(),
         });
-    }
 
-    Ok(assistant_text)
+        chat.token_stats.clone()
+    };
+
+    Ok(SendMessageResponse {
+        text: assistant_text,
+        token_stats: current_stats,
+    })
 }
 
-/// Clear conversation history
+/// Clear conversation history and reset token stats
 #[tauri::command]
 fn clear_history(state: State<'_, Mutex<ChatState>>) -> Result<(), String> {
     let mut chat = state.lock().map_err(|e| format!("State lock error: {}", e))?;
     chat.history.clear();
+    chat.token_stats = TokenStats::default();
     Ok(())
+}
+
+/// Get current token usage statistics
+#[tauri::command]
+fn get_token_stats(state: State<'_, Mutex<ChatState>>) -> Result<TokenStats, String> {
+    let chat = state.lock().map_err(|e| format!("State lock error: {}", e))?;
+    Ok(chat.token_stats.clone())
 }
 
 /// Switch model
@@ -248,6 +301,7 @@ pub fn run() {
             set_model,
             get_current_model,
             get_machine_status,
+            get_token_stats,
         ])
         .setup(|app| {
             // Build tray menu
