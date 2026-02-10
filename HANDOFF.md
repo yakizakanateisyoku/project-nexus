@@ -1,6 +1,6 @@
 # Project Nexus — 引き継ぎ資料
 
-> **最終更新**: 2026-02-10 (Phase 3-B Precision SSH設定済み・ネットワーク未解決)
+> **最終更新**: 2026-02-11 (Phase 4-B マシン設定外部化 + Notion連携 完了)
 > **リポジトリ**: https://github.com/yakizakanateisyoku/project-nexus
 > **作業PC**: OMEN（Commander）
 
@@ -23,7 +23,8 @@ SSH経由でリモート制御し、複数PCでAIタスクを分散実行する�
 | 3-A | SSH基盤構築（OMEN側） | ✅ 完了 |
 | 3-C | UI拡張（マシン監視・リモート実行） | ✅ 完了 |
 | 3-B | リモートPC環境セットアップ | 🔶 SIGMA完了・Precision SSH設定済み（ネットワーク未解決でスキップ） |
-| 4 | スマート機能（ストリーミング等） | ⬜ 予定 |
+| 4-A | ストリーミング応答・システムプロンプト強化 | ✅ 完了 |
+| 4-B | マシン設定外部化（ローカル+Notion） | ✅ 完了 |
 | 5 | マルチAI連携（GPT-4o, Gemini） | ⬜ 予定 |
 | 6 | 磨き込み（Notion連携, UI/UX） | ⬜ 予定 |
 
@@ -112,8 +113,45 @@ Host precision
 
 ---
 
-## Phase 4（予定）: スマート機能
-- ⬜ ストリーミング応答（リアルタイム文字表示）— tokio導入済みで実装可能
+## Phase 4-A ✅ ストリーミング応答・システムプロンプト強化
+
+- **SSEストリーミング**: Rust側でSSEパース → Tauri event → JSリアルタイム描画
+- **カーソルアニメーション**: ストリーミング中の点滅カーソル表示
+- **ツールステータスUI修正**: executing/completed/errorの重複排除、ストリーム終了時に自動クリーンアップ
+- **システムプロンプト強化**: マシンごとのOS情報・notes追加、OS適切なコマンド使用ルール明記
+- **SshMachineConfig拡張**: `os: String`, `notes: String` フィールド追加（現在ハードコード）
+
+## Phase 4-B ✅ マシン設定外部化 + Notion連携
+
+### ローカル設定（machines.toml）
+- **machines.toml**: `nexus-app/` 直下に配置。ハードコードから外部化完了
+- **toml crate追加**: `Cargo.toml` に `toml = "0.8"` 追加
+- **フォールバック**: toml読み込み失敗時はハードコードデフォルト値で動作
+
+### Notion連携
+- **Notion Integration**: 「Project Nexus」内部インテグレーション作成済み
+- **APIキー**: `.env` に `NOTION_API_KEY` として保存
+- **非同期フェッチ**: 起動時にバックグラウンドで全マシンのNotionページ取得
+- **システムプロンプト統合**: `build_system_prompt()` がローカル+Notion情報を結合
+- **フォールバック**: Notion接続不可時はローカル情報のみで動作
+
+### .envファイル探索順序
+1. カレントディレクトリの `.env`
+2. `src-tauri/.env`（cargo run時のフォールバック）
+3. 実行ファイルと同階層の `.env`
+
+### Notionページ（接続済み）
+| マシン | ページID | URL |
+|--------|----------|-----|
+| SIGMA | `3037e628-88da-8170-9718-c8a9383d4a26` | https://www.notion.so/3037e62888da81709718c8a9383d4a26 |
+| Precision | `3037e628-88da-81a4-807b-f9afc16fa752` | https://www.notion.so/3037e62888da81a4807bf9afc16fa752 |
+
+### 注意事項
+- Notion APIキーは `.env` に配置（`NOTION_API_KEY`）
+- フェッチは起動時1回のみ（軽量化。手動リフレッシュボタンは将来検討）
+- Notionページの接続: 親ページ「🖥️ Project Nexus 調査メモ」にインテグレーション接続済み
+
+## Phase 4（残り予定）
 - ⬜ 自動スレッド切替（コンテキスト満杯時）
 - ⬜ 作業中断チェック＆自動引き継ぎ生成
 
@@ -122,7 +160,6 @@ Host precision
 - ⬜ AI別タブ・比較表示
 
 ## Phase 6（予定）: 磨き込み
-- ⬜ Notion連携
 - ⬜ UI/UXブラッシュアップ
 - ⬜ Markdown/コードハイライト表示
 
@@ -136,6 +173,8 @@ project-nexus/
 ├── README.md
 └── nexus-app/
     ├── start-nexus.bat     # 環境変数付き起動 (.envからAPIキー読込)
+    ├── machines.toml       # マシン定義（外部設定ファイル）
+    ├── .env                # APIキー（ANTHROPIC_API_KEY, NOTION_API_KEY）
     ├── package.json
     ├── src/
     │   ├── index.html      # チャットUI (サイドバー, リモートパネル)
@@ -156,10 +195,10 @@ project-nexus/
 
 ## 技術メモ
 
-- **Rust crate**: tauri 2, reqwest 0.12 (rustls-tls), tokio 1, serde, dotenvy, base64
+- **Rust crate**: tauri 2, reqwest 0.12 (rustls-tls), tokio 1, serde, dotenvy, base64, toml 0.8
 - **SSH方式**: Windows標準 `ssh.exe` — 外部crateなし、将来 `russh` 移行可能
 - **ポーリング**: 15秒間隔（SSH接続テストのオーバーヘッド最小化）
-- **APIキー**: `.env` ファイル → `dotenvy` → `ANTHROPIC_API_KEY`
+- **APIキー**: `.env` ファイル → `dotenvy` → `ANTHROPIC_API_KEY`, `NOTION_API_KEY`
 - **PATH競合注意**: Claude Desktop (`claude.exe`) と Claude Code CLI (`claude.cmd`) が共存
 - **コスト意識**: Haiku 4.5デフォルト候補（入力$0.80/M vs Sonnet $3.0/M）
 

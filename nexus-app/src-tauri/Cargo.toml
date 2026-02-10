@@ -27,4 +27,6 @@ base64 = "0.22"
 tokio = { version = "1", features = ["sync", "process", "time", "rt-multi-thread", "macros"] }
 dotenvy = "0.15"
 encoding_rs = "0.8"
+futures-util = "0.3"
+toml = "0.8"
 

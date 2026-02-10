@@ -7,9 +7,11 @@
 // - Cost estimation and context warnings
 // - Tool Use: Claude が自律的にSSHコマンドを実行
 
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 use std::time::Duration;
+use std::path::PathBuf;
 use tauri::{
     menu::{MenuBuilder, MenuItemBuilder},
     tray::TrayIconBuilder,
@@ -49,7 +51,7 @@ struct HistoryMessage {
     content: String,
 }
 
-/// API送信用リクエスト（tools / system 対応）
+/// API送信用リクエスト（tools / system / stream 対応）
 #[derive(Serialize)]
 struct ApiRequest {
     model: String,
@@ -59,6 +61,8 @@ struct ApiRequest {
     messages: Vec<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<bool>,
 }
 
 /// APIレスポンス
@@ -156,6 +160,113 @@ struct SendMessageResponse {
 }
 
 // ========================================
+// Notion API — ソフトウェア情報フェッチ
+// ========================================
+
+/// Notionページからプレーンテキストを抽出（軽量: ブロック取得のみ）
+async fn fetch_notion_page_text(page_id: &str, api_key: &str) -> Result<String, String> {
+    let url = format!(
+        "https://api.notion.com/v1/blocks/{}/children?page_size=100",
+        page_id
+    );
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Notion-Version", "2022-06-28")
+        .send()
+        .await
+        .map_err(|e| format!("Notion API error: {}", e))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("Notion API HTTP {}", resp.status()));
+    }
+
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Notion parse error: {}", e))?;
+
+    // ブロックからテキストを抽出
+    let mut lines = Vec::new();
+    if let Some(results) = body["results"].as_array() {
+        for block in results {
+            let block_type = block["type"].as_str().unwrap_or("");
+            let rich_text_path = match block_type {
+                "paragraph" => Some("paragraph"),
+                "heading_1" => Some("heading_1"),
+                "heading_2" => Some("heading_2"),
+                "heading_3" => Some("heading_3"),
+                "bulleted_list_item" => Some("bulleted_list_item"),
+                "numbered_list_item" => Some("numbered_list_item"),
+                "toggle" => Some("toggle"),
+                "callout" => Some("callout"),
+                _ => None,
+            };
+
+            if let Some(path) = rich_text_path {
+                if let Some(rich_text) = block[path]["rich_text"].as_array() {
+                    let text: String = rich_text
+                        .iter()
+                        .filter_map(|rt| rt["plain_text"].as_str())
+                        .collect::<Vec<&str>>()
+                        .join("");
+                    if !text.is_empty() {
+                        let prefix = match block_type {
+                            "heading_1" => "# ",
+                            "heading_2" => "## ",
+                            "heading_3" => "### ",
+                            "bulleted_list_item" => "- ",
+                            "numbered_list_item" => "• ",
+                            _ => "",
+                        };
+                        lines.push(format!("{}{}", prefix, text));
+                    }
+                }
+            }
+        }
+    }
+
+    if lines.is_empty() {
+        Err("Notionページにテキストなし".to_string())
+    } else {
+        Ok(lines.join("\n"))
+    }
+}
+
+/// 全マシンのNotion情報を一括フェッチ
+async fn fetch_all_notion_info(
+    machines: &[SshMachineConfig],
+) -> std::collections::HashMap<String, String> {
+    let mut info = std::collections::HashMap::new();
+
+    let api_key = match std::env::var("NOTION_API_KEY") {
+        Ok(key) if !key.is_empty() => key,
+        _ => {
+            eprintln!("[Nexus] NOTION_API_KEY not set, skipping Notion fetch");
+            return info;
+        }
+    };
+
+    for machine in machines {
+        if let Some(page_id) = &machine.notion_page_id {
+            match fetch_notion_page_text(page_id, &api_key).await {
+                Ok(text) => {
+                    eprintln!("[Nexus] Notion info loaded for {}", machine.name);
+                    info.insert(machine.name.clone(), text);
+                }
+                Err(e) => {
+                    eprintln!("[Nexus] Notion fetch failed for {}: {}", machine.name, e);
+                }
+            }
+        }
+    }
+
+    info
+}
+
+// ========================================
 // Tool Use — ヘルパー関数
 // ========================================
 
@@ -193,7 +304,7 @@ fn build_tools(machines: &[SshMachineConfig]) -> Vec<serde_json::Value> {
 }
 
 /// システムプロンプト生成（マシン情報を注入）
-fn build_system_prompt(machines: &[SshMachineConfig]) -> String {
+fn build_system_prompt(machines: &[SshMachineConfig], notion_info: &std::collections::HashMap<String, String>) -> String {
     let machine_info: Vec<String> = machines
         .iter()
         .map(|m| {
@@ -204,16 +315,28 @@ fn build_system_prompt(machines: &[SshMachineConfig]) -> String {
             } else {
                 "無効"
             };
-            format!("- {}: {} [{}]", m.name, m.role, status)
+            let notes_part = if m.notes.is_empty() {
+                String::new()
+            } else {
+                format!(" — {}", m.notes)
+            };
+            let notion_part = notion_info.get(&m.name).map_or(String::new(), |info| {
+                format!("\n  ソフトウェア情報:\n  {}", info.replace('\n', "\n  "))
+            });
+            format!("- {} ({}): OS={}, {} [{}]{}{}", m.name, m.role, m.os, status, m.host, notes_part, notion_part)
         })
         .collect();
 
     format!(
         "あなたはProject Nexusのシステム管理アシスタントです。\n\
-         以下のマシンをSSH経由でリモート管理できます：\n{}\n\n\
-         ユーザーの指示に応じて execute_remote_command ツールで適切なコマンドを実行し、\n\
-         結果を日本語で分かりやすく説明してください。\n\
-         コマンド実行が不要な質問には通常通り回答してください。",
+         管理対象マシン:\n{}\n\n\
+         重要なルール:\n\
+         - 各マシンのOSに対応したコマンドを使うこと（WindowsならPowerShell/cmd、Linuxならbash）\n\
+         - Windowsマシンではdu/find等のLinuxコマンドは使わず、dir/powershell/Get-ChildItem等を使う\n\
+         - SSHでのWindows接続はcmd.exeシェルで実行される。PowerShellが必要なら powershell -Command \"...\" を使う\n\
+         - コマンドは1回で正確に実行し、試行錯誤を最小限にする\n\
+         - 結果は日本語で簡潔に説明する\n\
+         - コマンド実行が不要な質問には通常通り回答する",
         machine_info.join("\n")
     )
 }
@@ -244,6 +367,8 @@ async fn execute_tool_ssh(
             .args([
                 "-o", "BatchMode=yes",
                 "-o", "ConnectTimeout=5",
+                "-o", "ServerAliveInterval=30",
+                "-o", "ServerAliveCountMax=3",
                 &machine.host,
                 command,
             ])
@@ -296,6 +421,7 @@ async fn call_anthropic(
         } else {
             Some(tools.to_vec())
         },
+        stream: None,
     };
 
     let response = client
@@ -332,10 +458,318 @@ async fn call_anthropic(
 }
 
 // ========================================
+// Streaming SSE Parser
+// ========================================
+
+/// SSEストリーミングでAnthropic APIを呼び出し、Tauriイベントでフロントに配信
+/// Tool Use発生時はツール実行後に再ストリームするループ構造
+async fn call_anthropic_stream(
+    api_key: &str,
+    model: &str,
+    system: &str,
+    tools: &[serde_json::Value],
+    messages: &[serde_json::Value],
+    app_handle: &tauri::AppHandle,
+    machines: &[SshMachineConfig],
+) -> Result<(String, Vec<ToolExecution>, UsageInfo, u64), String> {
+    let client = reqwest::Client::new();
+    let mut api_messages = messages.to_vec();
+    let mut all_text_parts: Vec<String> = Vec::new();
+    let mut all_tool_executions: Vec<ToolExecution> = Vec::new();
+    let mut total_usage = UsageInfo::default();
+    let mut last_call_input_tokens: u64 = 0;
+
+    for _loop_count in 0..MAX_TOOL_LOOPS {
+        let body = ApiRequest {
+            model: model.to_string(),
+            max_tokens: 4096,
+            system: Some(system.to_string()),
+            messages: api_messages.clone(),
+            tools: if tools.is_empty() {
+                None
+            } else {
+                Some(tools.to_vec())
+            },
+            stream: Some(true),
+        };
+
+        let response = client
+            .post(API_URL)
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("API接続エラー: {}", e))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            return Err(format!("API Error ({}): {}", status, &text[..200.min(text.len())]));
+        }
+
+        // SSEパース状態
+        let mut current_text = String::new();
+        let mut content_blocks: Vec<serde_json::Value> = Vec::new();
+        // tool_use蓄積用: index → (id, name, input_json_str)
+        let mut tool_use_map: std::collections::HashMap<u64, (String, String, String)> =
+            std::collections::HashMap::new();
+        let mut stop_reason: Option<String> = None;
+        let mut line_buf = String::new();
+
+        let mut byte_stream = response.bytes_stream();
+        while let Some(chunk_result) = byte_stream.next().await {
+            let chunk = chunk_result.map_err(|e| format!("Stream error: {}", e))?;
+            let chunk_str = String::from_utf8_lossy(&chunk);
+
+            line_buf.push_str(&chunk_str);
+
+            // 改行で分割してSSEイベントを処理
+            while let Some(newline_pos) = line_buf.find('\n') {
+                let line = line_buf[..newline_pos].trim_end_matches('\r').to_string();
+                line_buf = line_buf[newline_pos + 1..].to_string();
+
+                if !line.starts_with("data: ") {
+                    continue;
+                }
+                let data = &line[6..];
+                if data == "[DONE]" {
+                    continue;
+                }
+
+                let Ok(event) = serde_json::from_str::<serde_json::Value>(data) else {
+                    continue;
+                };
+
+                let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+                match event_type {
+                    "message_start" => {
+                        // input_tokens取得
+                        if let Some(usage) = event.pointer("/message/usage") {
+                            if let Some(it) = usage.get("input_tokens").and_then(|v| v.as_u64()) {
+                                last_call_input_tokens = it;
+                                total_usage.input_tokens += it;
+                            }
+                        }
+                    }
+                    "content_block_start" => {
+                        let index = event.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+                        if let Some(block) = event.get("content_block") {
+                            let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                            if block_type == "tool_use" {
+                                let id = block.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                tool_use_map.insert(index, (id, name, String::new()));
+                            }
+                        }
+                    }
+                    "content_block_delta" => {
+                        let index = event.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+                        if let Some(delta) = event.get("delta") {
+                            let delta_type = delta.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                            match delta_type {
+                                "text_delta" => {
+                                    if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
+                                        current_text.push_str(text);
+                                        // フロントエンドにデルタ送信
+                                        let _ = app_handle.emit("stream-delta", serde_json::json!({ "text": text }));
+                                    }
+                                }
+                                "input_json_delta" => {
+                                    if let Some(partial) = delta.get("partial_json").and_then(|t| t.as_str()) {
+                                        if let Some(entry) = tool_use_map.get_mut(&index) {
+                                            entry.2.push_str(partial);
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    "message_delta" => {
+                        if let Some(delta) = event.get("delta") {
+                            if let Some(sr) = delta.get("stop_reason").and_then(|v| v.as_str()) {
+                                stop_reason = Some(sr.to_string());
+                            }
+                        }
+                        if let Some(usage) = event.get("usage") {
+                            if let Some(ot) = usage.get("output_tokens").and_then(|v| v.as_u64()) {
+                                total_usage.output_tokens += ot;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // テキスト部分を保存
+        if !current_text.is_empty() {
+            all_text_parts.push(current_text.clone());
+        }
+
+        // content_blocksを再構築（履歴用）
+        if !current_text.is_empty() {
+            content_blocks.push(serde_json::json!({ "type": "text", "text": current_text }));
+        }
+        for (_, (id, name, input_json)) in &tool_use_map {
+            let input: serde_json::Value = serde_json::from_str(input_json).unwrap_or(serde_json::json!({}));
+            content_blocks.push(serde_json::json!({
+                "type": "tool_use",
+                "id": id,
+                "name": name,
+                "input": input
+            }));
+        }
+
+        // アシスタント応答をメッセージ配列に追加
+        api_messages.push(serde_json::json!({
+            "role": "assistant",
+            "content": content_blocks
+        }));
+
+        // ツール呼び出しがなければ終了
+        if tool_use_map.is_empty() || stop_reason.as_deref() != Some("tool_use") {
+            break;
+        }
+
+        // ツール実行
+        let mut tool_results: Vec<serde_json::Value> = Vec::new();
+        // indexでソートして順番に実行
+        let mut sorted_tools: Vec<_> = tool_use_map.into_iter().collect();
+        sorted_tools.sort_by_key(|(idx, _)| *idx);
+
+        for (_, (tool_id, tool_name, input_json)) in sorted_tools {
+            let input: serde_json::Value = serde_json::from_str(&input_json).unwrap_or(serde_json::json!({}));
+            let machine_name = input.get("machine_name").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let command = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
+
+            let _ = app_handle.emit("tool-executing", ToolExecutingEvent {
+                machine_name: machine_name.to_string(),
+                command: command.to_string(),
+            });
+
+            if tool_name == "execute_remote_command" {
+                let exec_result = execute_tool_ssh(machine_name, command, machines).await;
+
+                let _ = app_handle.emit("tool-completed", ToolCompletedEvent {
+                    machine_name: machine_name.to_string(),
+                    command: command.to_string(),
+                    success: exec_result.success,
+                });
+
+                let result_text = if exec_result.success {
+                    if exec_result.stdout.is_empty() { "(コマンド成功・出力なし)".to_string() } else { exec_result.stdout.clone() }
+                } else {
+                    format!("エラー: {}{}", exec_result.stderr, if !exec_result.stdout.is_empty() { format!("\nstdout: {}", exec_result.stdout) } else { String::new() })
+                };
+
+                tool_results.push(serde_json::json!({
+                    "type": "tool_result",
+                    "tool_use_id": tool_id,
+                    "content": result_text,
+                    "is_error": !exec_result.success
+                }));
+                all_tool_executions.push(exec_result);
+            } else {
+                tool_results.push(serde_json::json!({
+                    "type": "tool_result",
+                    "tool_use_id": tool_id,
+                    "content": format!("未知のツール: {}", tool_name),
+                    "is_error": true
+                }));
+            }
+        }
+
+        // ツール結果をuserメッセージとして追加して次のループへ
+        api_messages.push(serde_json::json!({
+            "role": "user",
+            "content": tool_results
+        }));
+
+        // 次のストリームループ開始をフロントに通知
+        let _ = app_handle.emit("stream-tool-continue", serde_json::json!({}));
+    }
+
+    let final_text = all_text_parts.join("");
+    let final_text = if final_text.is_empty() {
+        "(空の応答が返されました)".to_string()
+    } else {
+        final_text
+    };
+
+    Ok((final_text, all_tool_executions, total_usage, last_call_input_tokens))
+}
+
+// ========================================
 // Tauri Commands
 // ========================================
 
-/// Send a message via Anthropic API with Tool Use support
+/// Send a message via streaming SSE (primary)
+#[tauri::command]
+async fn send_message_stream(
+    message: String,
+    state: State<'_, Mutex<ChatState>>,
+    ssh_state: State<'_, Mutex<SshState>>,
+    app_handle: tauri::AppHandle,
+) -> Result<SendMessageResponse, String> {
+    let api_key = std::env::var("ANTHROPIC_API_KEY")
+        .map_err(|_| "ANTHROPIC_API_KEY 環境変数が設定されていません".to_string())?;
+
+    let (tools, system_prompt, machines) = {
+        let ssh = ssh_state.lock().map_err(|e| format!("Lock error: {}", e))?;
+        (build_tools(&ssh.machines), build_system_prompt(&ssh.machines, &ssh.notion_info), ssh.machines.clone())
+    };
+
+    let api_messages: Vec<serde_json::Value> = {
+        let mut chat = state.lock().map_err(|e| format!("State lock error: {}", e))?;
+        chat.history.push(HistoryMessage { role: "user".to_string(), content: message.clone() });
+        if chat.history.len() > MAX_HISTORY {
+            let drain_count = chat.history.len() - MAX_HISTORY;
+            chat.history.drain(..drain_count);
+        }
+        chat.history.iter().map(|m| serde_json::json!({ "role": m.role, "content": m.content })).collect()
+    };
+
+    let model = {
+        let chat = state.lock().map_err(|e| format!("State lock error: {}", e))?;
+        chat.model.clone()
+    };
+
+    // stream-start イベント
+    let _ = app_handle.emit("stream-start", serde_json::json!({}));
+
+    let (final_text, tool_executions, total_usage, last_call_input_tokens) =
+        call_anthropic_stream(&api_key, &model, &system_prompt, &tools, &api_messages, &app_handle, &machines).await?;
+
+    // 履歴とトークン統計を更新
+    let current_stats = {
+        let mut chat = state.lock().map_err(|e| format!("State lock error: {}", e))?;
+        chat.token_stats.last_input_tokens = last_call_input_tokens;
+        chat.token_stats.last_output_tokens = total_usage.output_tokens;
+        chat.token_stats.total_input_tokens += total_usage.input_tokens;
+        chat.token_stats.total_output_tokens += total_usage.output_tokens;
+        chat.token_stats.request_count += 1;
+        chat.history.push(HistoryMessage { role: "assistant".to_string(), content: final_text.clone() });
+        chat.token_stats.clone()
+    };
+
+    // stream-end イベント
+    let _ = app_handle.emit("stream-end", serde_json::json!({
+        "token_stats": current_stats,
+        "tool_executions": tool_executions
+    }));
+
+    Ok(SendMessageResponse {
+        text: final_text,
+        token_stats: current_stats,
+        tool_executions,
+    })
+}
+
+/// Send a message via Anthropic API (non-streaming fallback)
 #[tauri::command]
 async fn send_message(
     message: String,
@@ -351,7 +785,7 @@ async fn send_message(
         let ssh = ssh_state.lock().map_err(|e| format!("Lock error: {}", e))?;
         (
             build_tools(&ssh.machines),
-            build_system_prompt(&ssh.machines),
+            build_system_prompt(&ssh.machines, &ssh.notion_info),
             ssh.machines.clone(),
         )
     };
@@ -633,6 +1067,51 @@ struct MachineStatus {
 // ========================================
 // SSH Remote Management (Phase 3-A)
 // ========================================
+// machines.toml 設定構造体
+// ========================================
+
+#[derive(Deserialize, Debug)]
+struct MachinesFileConfig {
+    ssh: Option<SshFileConfig>,
+    machines: Vec<MachineEntry>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+struct SshFileConfig {
+    timeout_secs: Option<u64>,
+    keepalive_interval: Option<u32>,
+    keepalive_count_max: Option<u32>,
+}
+
+#[derive(Deserialize, Debug)]
+struct MachineEntry {
+    name: String,
+    host: String,
+    role: String,
+    enabled: bool,
+    os: String,
+    notes: Option<String>,
+    notion_page_id: Option<String>,
+}
+
+/// SSH接続維持設定（グローバル）
+struct SshGlobalConfig {
+    timeout_secs: u64,
+    keepalive_interval: u32,
+    keepalive_count_max: u32,
+}
+
+impl Default for SshGlobalConfig {
+    fn default() -> Self {
+        Self {
+            timeout_secs: 5,
+            keepalive_interval: 30,
+            keepalive_count_max: 3,
+        }
+    }
+}
+
+// ========================================
 
 const SSH_TIMEOUT_SECS: u64 = 5;
 
@@ -642,6 +1121,10 @@ struct SshMachineConfig {
     host: String,       // ~/.ssh/config の Host名 or IPアドレス
     role: String,       // "Commander" | "Remote"
     enabled: bool,      // 接続試行するか
+    os: String,         // "Windows" | "Linux"
+    notes: String,      // マシン用途・特記事項
+    #[serde(default)]
+    notion_page_id: Option<String>,  // Notionページ（ソフトウェア情報）
 }
 
 impl Default for SshMachineConfig {
@@ -651,37 +1134,125 @@ impl Default for SshMachineConfig {
             host: String::new(),
             role: "Remote".to_string(),
             enabled: true,
+            os: "Windows".to_string(),
+            notes: String::new(),
+            notion_page_id: None,
         }
     }
 }
 
 struct SshState {
     machines: Vec<SshMachineConfig>,
+    global_config: SshGlobalConfig,
+    /// Notion APIから取得したソフトウェア情報（マシン名 → 情報テキスト）
+    notion_info: std::collections::HashMap<String, String>,
 }
 
-impl Default for SshState {
-    fn default() -> Self {
+/// machines.tomlのパスを解決（実行ファイルからの相対パス対応）
+fn resolve_machines_toml_path() -> Option<PathBuf> {
+    // 1. カレントディレクトリ
+    let cwd_path = std::path::Path::new("machines.toml");
+    if cwd_path.exists() {
+        return Some(cwd_path.to_path_buf());
+    }
+    // 2. 実行ファイルの親ディレクトリ
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            let path = exe_dir.join("machines.toml");
+            if path.exists() {
+                return Some(path);
+            }
+            // 3. 開発時: src-tauri/../../machines.toml (nexus-app/直下)
+            let dev_path = exe_dir
+                .join("..")
+                .join("..")
+                .join("..")
+                .join("machines.toml");
+            if dev_path.exists() {
+                return Some(dev_path);
+            }
+        }
+    }
+    None
+}
+
+/// machines.tomlからマシン設定を読み込み
+fn load_machines_config() -> SshState {
+    if let Some(toml_path) = resolve_machines_toml_path() {
+        if let Ok(content) = std::fs::read_to_string(&toml_path) {
+            if let Ok(config) = toml::from_str::<MachinesFileConfig>(&content) {
+                let global = config.ssh.as_ref().map_or(SshGlobalConfig::default(), |s| {
+                    SshGlobalConfig {
+                        timeout_secs: s.timeout_secs.unwrap_or(5),
+                        keepalive_interval: s.keepalive_interval.unwrap_or(30),
+                        keepalive_count_max: s.keepalive_count_max.unwrap_or(3),
+                    }
+                });
+
+                let machines = config
+                    .machines
+                    .into_iter()
+                    .map(|m| SshMachineConfig {
+                        name: m.name,
+                        host: m.host,
+                        role: m.role,
+                        enabled: m.enabled,
+                        os: m.os,
+                        notes: m.notes.unwrap_or_default(),
+                        notion_page_id: m.notion_page_id,
+                    })
+                    .collect();
+
+                eprintln!("[Nexus] machines.toml loaded from: {}", toml_path.display());
+                return SshState {
+                    machines,
+                    global_config: global,
+                    notion_info: std::collections::HashMap::new(),
+                };
+            } else {
+                eprintln!("[Nexus] Warning: machines.toml parse error, using defaults");
+            }
+        }
+    }
+    eprintln!("[Nexus] Warning: machines.toml not found, using hardcoded defaults");
+    SshState::hardcoded_defaults()
+}
+
+impl SshState {
+    /// フォールバック: tomlが見つからない場合のハードコードデフォルト
+    fn hardcoded_defaults() -> Self {
         Self {
             machines: vec![
                 SshMachineConfig {
                     name: "OMEN".to_string(),
                     host: "localhost".to_string(),
                     role: "Commander".to_string(),
-                    enabled: false, // 自分自身なので不要
+                    enabled: false,
+                    os: "Windows".to_string(),
+                    notes: "メイン開発機。Nexusアプリ実行中".to_string(),
+                    notion_page_id: None,
                 },
                 SshMachineConfig {
                     name: "SIGMA".to_string(),
-                    host: "sigma".to_string(),  // ~/.ssh/config の Host名
+                    host: "sigma".to_string(),
                     role: "Remote".to_string(),
                     enabled: true,
+                    os: "Windows".to_string(),
+                    notes: "LattePanda Sigma".to_string(),
+                    notion_page_id: Some("3037e628-88da-8170-9718-c8a9383d4a26".to_string()),
                 },
                 SshMachineConfig {
                     name: "Precision".to_string(),
                     host: "precision".to_string(),
                     role: "Remote".to_string(),
                     enabled: true,
+                    os: "Windows".to_string(),
+                    notes: "Dell Precision 3630 ワークステーション".to_string(),
+                    notion_page_id: Some("3037e628-88da-81a4-807b-f9afc16fa752".to_string()),
                 },
             ],
+            global_config: SshGlobalConfig::default(),
+            notion_info: std::collections::HashMap::new(),
         }
     }
 }
@@ -695,6 +1266,8 @@ async fn ssh_check_alive(host: &str) -> bool {
                 "-o", "BatchMode=yes",
                 "-o", "ConnectTimeout=3",
                 "-o", "StrictHostKeyChecking=accept-new",
+                "-o", "ServerAliveInterval=30",
+                "-o", "ServerAliveCountMax=3",
                 host,
                 "echo", "nexus-ping",
             ])
@@ -773,6 +1346,8 @@ async fn execute_remote_command(
             .args([
                 "-o", "BatchMode=yes",
                 "-o", "ConnectTimeout=5",
+                "-o", "ServerAliveInterval=30",
+                "-o", "ServerAliveCountMax=3",
                 &machine.host,
                 &command,
             ])
@@ -843,20 +1418,24 @@ pub fn run() {
     // Load .env file (API keys etc.) — GUI起動時に環境変数が見えない問題の対策
     // 1. カレントディレクトリの.envを試行
     if dotenvy::dotenv().is_err() {
-        // 2. 実行ファイルと同階層の.envを試行
-        if let Ok(exe_path) = std::env::current_exe() {
-            if let Some(exe_dir) = exe_path.parent() {
-                let env_path = exe_dir.join(".env");
-                let _ = dotenvy::from_path(&env_path);
+        // 2. src-tauri/.env を試行（cargo run時のカレントがnexus-app/の場合）
+        if dotenvy::from_path("src-tauri/.env").is_err() {
+            // 3. 実行ファイルと同階層の.envを試行
+            if let Ok(exe_path) = std::env::current_exe() {
+                if let Some(exe_dir) = exe_path.parent() {
+                    let env_path = exe_dir.join(".env");
+                    let _ = dotenvy::from_path(&env_path);
+                }
             }
         }
     }
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(Mutex::new(ChatState::default()))
-        .manage(Mutex::new(SshState::default()))
+        .manage(Mutex::new(load_machines_config()))
         .invoke_handler(tauri::generate_handler![
             send_message,
+            send_message_stream,
             clear_history,
             reset_cost,
             set_model,
@@ -906,6 +1485,28 @@ pub fn run() {
                     }
                 })
                 .build(app)?;
+
+            // Notion情報の非同期フェッチ（バックグラウンド、起動をブロックしない）
+            {
+                let ssh_state = app.state::<Mutex<SshState>>();
+                let machines = {
+                    let state = ssh_state.lock().unwrap();
+                    state.machines.clone()
+                };
+                let app_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    eprintln!("[Nexus] Starting Notion info fetch...");
+                    let notion_info = fetch_all_notion_info(&machines).await;
+                    if !notion_info.is_empty() {
+                        eprintln!("[Nexus] Notion info loaded for {} machine(s)", notion_info.len());
+                        let ssh_state = app_handle.state::<Mutex<SshState>>();
+                        let mut state = ssh_state.lock().unwrap();
+                        state.notion_info = notion_info;
+                    } else {
+                        eprintln!("[Nexus] No Notion info fetched (key missing or no pages configured)");
+                    }
+                });
+            }
 
             Ok(())
         })

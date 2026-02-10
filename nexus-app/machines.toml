@@ -1,0 +1,33 @@
+# Project Nexus — マシン設定ファイル
+# Phase 4-B: 設定外部化
+
+[ssh]
+timeout_secs = 5
+keepalive_interval = 30
+keepalive_count_max = 3
+
+[[machines]]
+name = "OMEN"
+host = "localhost"
+role = "Commander"
+enabled = false
+os = "Windows"
+notes = "メイン開発機。Nexusアプリ実行中"
+
+[[machines]]
+name = "SIGMA"
+host = "sigma"
+role = "Remote"
+enabled = true
+os = "Windows"
+notes = "LattePanda Sigma"
+notion_page_id = "3037e628-88da-8170-9718-c8a9383d4a26"
+
+[[machines]]
+name = "Precision"
+host = "precision"
+role = "Remote"
+enabled = true
+os = "Windows"
+notes = "Dell Precision 3630 ワークステーション"
+notion_page_id = "3037e628-88da-81a4-807b-f9afc16fa752"

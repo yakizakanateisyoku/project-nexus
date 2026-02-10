@@ -27,6 +27,9 @@ let currentModel = "claude-sonnet-4-5-20250929";
 let selectedRemoteMachine = null;
 let machineStatuses = [];
 let statusPollTimer = null;
+let streamingMsgEl = null; // 現在ストリーミング中のメッセージ要素
+let streamingContentEl = null; // ストリーミング中のcontent要素
+let streamingText = ""; // 蓄積テキスト
 const STATUS_POLL_INTERVAL = 15000; // 15秒間隔（軽量化）
 
 // Model pricing (per million tokens)
@@ -157,6 +160,9 @@ window.addEventListener("DOMContentLoaded", () => {
   // Tool Use: Tauri events for real-time status
   setupToolUseEvents();
 
+  // Streaming response events
+  setupStreamingEvents();
+
   // Initial machine status + start polling
   refreshMachineStatus();
   statusPollTimer = setInterval(refreshMachineStatus, STATUS_POLL_INTERVAL);
@@ -177,18 +183,105 @@ async function handleSend() {
   setProcessing(true);
 
   try {
-    const response = await invoke("send_message", { message: text });
-    // Phase 3-B: response is { text, token_stats, tool_executions }
-    addAssistantMessage(response.text, response.tool_executions || []);
+    // ストリーミングAPIを使用（イベント経由でリアルタイム表示）
+    const response = await invoke("send_message_stream", { message: text });
+    // stream-end イベントで統計更新済みだが、最終レスポンスからも反映
     currentTokenStats = response.token_stats;
     updateContextBadge(response.token_stats);
     checkContextWarning(response.token_stats);
+
+    // ストリーミング完了後：ツール実行サマリーがあれば追加
+    if (streamingMsgEl && response.tool_executions && response.tool_executions.length > 0) {
+      const summaryHtml = buildToolExecutionSummary(response.tool_executions);
+      streamingMsgEl.insertAdjacentHTML("beforeend", summaryHtml);
+    }
   } catch (err) {
+    // ストリーミング中のメッセージがあればクリーンアップ
+    cleanupStreamingState();
     addMessage("system", `Error: ${err}`);
   } finally {
+    cleanupStreamingState();
     setProcessing(false);
     chatInputEl.focus();
   }
+}
+
+// ========================================
+// Streaming Support
+// ========================================
+function cleanupStreamingState() {
+  streamingMsgEl = null;
+  streamingContentEl = null;
+  streamingText = "";
+}
+
+function setupStreamingEvents() {
+  // ストリーム開始：空のassistantメッセージ要素を作成
+  listen("stream-start", () => {
+    // タイピングインジケータ除去
+    const typingEl = messagesEl.querySelector(".typing-message");
+    if (typingEl) typingEl.remove();
+
+    streamingText = "";
+
+    const msgEl = document.createElement("div");
+    msgEl.className = "message assistant";
+    msgEl.innerHTML = `
+      <div class="message-sender">Claude</div>
+      <div class="message-content streaming-content"></div>
+    `;
+    messagesEl.appendChild(msgEl);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+
+    streamingMsgEl = msgEl;
+    streamingContentEl = msgEl.querySelector(".streaming-content");
+  });
+
+  // テキスト増分：リアルタイム表示
+  listen("stream-delta", (event) => {
+    if (!streamingContentEl) return;
+    streamingText += event.payload.text;
+    // シンプルなテキスト→HTML変換（改行対応）
+    streamingContentEl.innerHTML = formatStreamingText(streamingText);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  });
+
+  // ツール継続通知（UIは既存のtool-executingイベントで処理）
+  listen("stream-tool-continue", () => {
+    // ストリーミングテキストをリセットせず継続
+    // ツール結果後の追加テキストも同じメッセージに蓄積
+  });
+
+  // ストリーム完了
+  listen("stream-end", (event) => {
+    // ツールステータスメッセージをクリーンアップ
+    messagesEl.querySelectorAll(".tool-status-message").forEach((el) => el.remove());
+
+    const { token_stats } = event.payload;
+    if (token_stats) {
+      currentTokenStats = token_stats;
+      updateContextBadge(token_stats);
+      checkContextWarning(token_stats);
+    }
+    // ストリーミングクラス除去（カーソルアニメ停止用）
+    if (streamingContentEl) {
+      streamingContentEl.classList.remove("streaming-content");
+    }
+  });
+}
+
+/**
+ * ストリーミング中テキストのHTML変換
+ * Markdown風の最小限フォーマット
+ */
+function formatStreamingText(text) {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/\n/g, "<br>");
 }
 
 function addMessage(role, content) {
@@ -470,15 +563,11 @@ function showToolStatus(machineName, command, status) {
   const typingEl = messagesEl.querySelector(".typing-message");
   if (typingEl) typingEl.remove();
 
-  const statusEl = document.createElement("div");
-  statusEl.className = "message assistant tool-status-message";
-
   const icon = status === "executing" ? "⚙️" : status === "success" ? "✅" : "❌";
   const statusText = status === "executing" ? "実行中" : status === "success" ? "完了" : "エラー";
-  // コマンドが長い場合は省略
   const shortCmd = command.length > 40 ? command.substring(0, 37) + "..." : command;
 
-  statusEl.innerHTML = `
+  const innerHtml = `
     <div class="message-content tool-status ${status}">
       <span class="tool-status-icon">${icon}</span>
       <span class="tool-status-text">${machineName}: <code>${escapeHtml(shortCmd)}</code> ${statusText}</span>
@@ -486,7 +575,20 @@ function showToolStatus(machineName, command, status) {
     </div>
   `;
 
-  messagesEl.appendChild(statusEl);
+  if (status === "executing") {
+    // 新規作成
+    const statusEl = document.createElement("div");
+    statusEl.className = "message assistant tool-status-message";
+    statusEl.dataset.toolCmd = command; // 識別用
+    statusEl.innerHTML = innerHtml;
+    messagesEl.appendChild(statusEl);
+  } else {
+    // completedで最新のexecutingメッセージを上書き
+    const existing = messagesEl.querySelector(`.tool-status-message[data-tool-cmd="${CSS.escape(command)}"]`);
+    if (existing) {
+      existing.innerHTML = innerHtml;
+    }
+  }
   scrollToBottom();
 }
 
